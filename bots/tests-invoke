@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# This file is part of Cockpit.
+#
+# Copyright (C) 2016 Red Hat, Inc.
+#
+# Cockpit is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation; either version 2.1 of the License, or
+# (at your option) any later version.
+#
+# Cockpit is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Cockpit; If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+import errno
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import traceback
+
+sys.dont_write_bytecode = True
+
+import task
+from task import github
+from task import sink
+
+HOSTNAME = socket.gethostname().split(".")[0]
+BOTS = os.path.abspath(os.path.dirname(__file__))
+BASE = os.path.normpath(os.path.join(BOTS, ".."))
+DEVNULL = open("/dev/null", "r+")
+
+def main():
+    parser = argparse.ArgumentParser(description='Run integration tests')
+    parser.add_argument('-j', '--jobs', dest="jobs", type=int,
+            default=os.environ.get("TEST_JOBS", 1), help="Number of concurrent jobs")
+    parser.add_argument('--rebase', help="Rebase onto the specific branch before testing")
+    parser.add_argument('-o', "--offline", action='store_true',
+            help="Work offline, don''t fetch new data from origin for rebase")
+    parser.add_argument('--publish', dest='publish', default=os.environ.get("TEST_PUBLISH", ""),
+            action='store', help='Publish results centrally to a sink')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('context', help="The context or type of integration tests to run")
+    parser.add_argument('ref', nargs='?', help="The Git remote ref to pull")
+    opts = parser.parse_args()
+
+    name = os.environ.get("TEST_NAME", "tests")
+    revision = os.environ.get("TEST_REVISION")
+
+    try:
+        task = PullTask(name, revision, opts.ref, opts.context, opts.rebase)
+        ret = task.run(opts)
+    except RuntimeError, ex:
+        ret = str(ex)
+
+    if ret:
+        sys.stderr.write("tests-invoke: {0}\n".format(ret))
+        return 1
+    return 0
+
+class PullTask(object):
+    def __init__(self, name, revision, ref, context, base=None):
+        self.name = name
+        self.revision = revision
+        self.ref = ref
+        self.context = context
+        self.base = base
+
+        self.sink = None
+        self.github_status_data = None
+
+    def start_publishing(self, host):
+        api = github.GitHub()
+        identifier = "-".join([
+            self.name,
+            self.revision[0:8],
+            self.context.replace("/", "-")
+        ])
+
+        description = "{0} [{1}]".format(github.TESTING, HOSTNAME)
+
+        self.github_status_data = {
+            "state": "pending",
+            "context": self.context,
+            "description": description,
+            "target_url": ":link"
+        }
+
+        status = {
+            "github": {
+                "token": api.token,
+                "requests": [
+                    # Set status to pending
+                    { "method": "POST",
+                      "resource": api.qualify("statuses/" + self.revision),
+                      "data": self.github_status_data
+                    }
+                ],
+                "watches": [{
+                    "resource": api.qualify("commits/" + self.revision + "/status"),
+                    "result": {
+                        "statuses": [
+                            {
+                                "context": self.context,
+                                "description": description,
+                                "target_url": ":link"
+                            }
+                        ]
+                    }
+                }]
+            },
+            "revision": self.revision,
+            "link": "log.html",
+            "extras": [ "https://raw.githubusercontent.com/cockpit-project/cockpit/master/bots/task/log.html" ],
+
+            "onaborted": {
+                "github": {
+                    "token": api.token,
+                    "requests": [
+                        # Set status to error
+                        { "method": "POST",
+                          "resource": api.qualify("statuses/" + self.revision),
+                          "data": {
+                              "state": "error",
+                              "context": self.context,
+                              "description": "Aborted without status",
+                              "target_url": ":link"
+                          }
+                        }
+                    ]
+                },
+            }
+        }
+
+        # Include information about which base we're testing against
+        if self.base:
+            commit = subprocess.check_output([ "git", "rev-parse", "origin/" + self.base ]).strip()
+            status["base"] = commit
+
+        (prefix, unused, image) = self.context.partition("/")
+        if not self.base:
+            status['irc'] = { }    # Only send to IRC when master
+
+        # For other scripts to use
+        os.environ["TEST_DESCRIPTION"] = description
+        self.sink = sink.Sink(host, identifier, status)
+
+    def rebase(self):
+        origin_base = "origin/" + self.base
+
+        # Rebase this branch onto the base, but only if it's not already an ancestor
+        try:
+            if subprocess.call([ "git", "merge-base", "--is-ancestor", origin_base, "HEAD" ]) != 0:
+                sys.stderr.write("Rebasing onto " + origin_base + " ...\n")
+                subprocess.check_call([ "git", "rebase", origin_base ])
+        except subprocess.CalledProcessError:
+            subprocess.call([ "git", "rebase", "--abort" ])
+            traceback.print_exc()
+            return "Rebase failed"
+
+        try:
+            task.checkout(base=self.base)
+        except subprocess.CalledProcessError:
+            traceback.print_exc()
+            return "Rebase checkout of bots failed"
+
+        # If the bots directory changed during all of this, then respawn
+        if subprocess.call(["git", "diff", "--quiet", "--exit-code", "--staged", origin_base, "--", "bots/"]) == 1:
+            assert "TEST_INVOKE_RESPAWN" not in os.environ
+            os.environ["TEST_INVOKE_RESPAWN"] = "1"
+            sys.stderr.write("Rebase complete ... respawning\n")
+            if self.sink:
+                self.stop_publishing(None)
+            os.execv(__file__, sys.argv)
+            assert False, "not reached"
+
+        return None
+
+    def prepare(self, prefix, value, image, verbose=False):
+        sys.stderr.write("Preparing image: building and installing Cockpit ...\n")
+
+        try:
+            # Download all the additional images so that even older branches find them
+            subprocess.check_call([ os.path.join(BOTS, "image-download"),
+                "candlepin", "fedora-stock", "fedora-23-stock", "fedora-26",
+                "ipa", "openshift", "selenium", "windows-8"
+            ])
+
+        except subprocess.CalledProcessError:
+            return "Downloading of additional images failed"
+
+        # The images not yet prepared are symlinked from the bots/images
+        # directory into the test/images directory. This allows for other branches to
+        # run without modification, and allows tests to load images that they didn't
+        # install or need to install cockpit on (above).
+        bots_images = os.path.join(BOTS, "images")
+        test_images = os.path.join(BASE, "test", "images")
+        if not os.path.exists(test_images):
+            os.makedirs(test_images)
+        for name in os.listdir(bots_images):
+            if "." in name:
+                continue
+            target = os.path.join(bots_images, name)
+            if os.path.isdir(target):
+                continue
+            dest = os.path.join(test_images, name)
+            if not os.path.isfile(dest):
+                if os.path.lexists(dest):
+                    os.unlink(dest)
+                os.symlink(os.path.realpath(target), dest)
+
+        # COMPAT: Older branches require naughty files linked into specific places
+        # and do not use the image-pepare tooling
+        naughty_files = os.path.join(BOTS, "naughty")
+        for name in os.listdir(naughty_files):
+            dest = os.path.join(BASE, "test", "verify", "naughty-{0}".format(name))
+            if not os.path.islink(dest) and os.path.isdir(dest):
+                shutil.rmtree(dest)
+            elif os.path.lexists(dest):
+                os.unlink(dest)
+            os.symlink(os.path.join("..", "..", "bots", "naughty", name), dest)
+
+        # COMPAT: Create a legacy tmp/run directory to prevent races during testing
+        try:
+            os.makedirs(os.path.join(BASE, "test", "tmp", "run"))
+        except OSError, ex:
+            if ex.errno != errno.EEXIST:
+                raise
+
+        # Now actually run the prepare tooling
+        cmd = [ os.path.join(BOTS, "image-prepare") ]
+        if prefix == "image" or prefix == "container":
+            cmd += [ "--containers" ]
+        if verbose:
+            cmd += [ "--verbose" ]
+
+        try:
+            # Do the basic prepare
+            subprocess.check_call(cmd + [ image ])
+
+            # For containers tests we install to openshift too
+            if value == "kubernetes":
+                subprocess.check_call(cmd + [ "--install-only", "openshift" ])
+
+        except subprocess.CalledProcessError:
+            return "Preparation of testable image failed"
+
+    def stop_publishing(self, ret):
+        sink = self.sink
+        def mark_failed():
+            if "github" in sink.status:
+                self.github_status_data["state"] = "failure"
+            if "irc" in sink.status: # Never send success messages to IRC
+                sink.status["irc"]["channel"] = "#cockpit"
+        def mark_passed():
+            if "github" in sink.status:
+                self.github_status_data["state"] = "success"
+        def mark_respawn():
+            if "github" in sink.status:
+                self.github_status_data["state"] = "pending"
+        if isinstance(ret, basestring):
+            message = ret
+            mark_failed()
+        elif ret is None:
+            message = "Rebased"
+            mark_respawn()
+            ret = 0 # A failure, but not for this script
+        elif ret == 0:
+            message = "Tests passed"
+            mark_passed()
+        else:
+            message = "{0} tests failed".format(ret)
+            mark_failed()
+            ret = 0 # A failure, but not for this script
+        sink.status["message"] = message
+        if "github" in sink.status:
+            self.github_status_data["description"] = message
+        del sink.status["extras"]
+        sink.flush()
+
+        return ret
+
+    def run(self, opts):
+        if "TEST_INVOKE_RESPAWN" not in os.environ:
+            head = subprocess.check_output([ "git", "rev-parse", "HEAD" ]).strip()
+            if self.ref:
+                if not opts.offline:
+                    subprocess.check_call([ "git", "fetch", "origin", self.ref ])
+                if not self.revision:
+                    self.revision = subprocess.check_output([ "git", "rev-parse", "FETCH_HEAD" ]).strip()
+                # Force a checkout of the ref if not already checked out
+                if not head.lower().startswith(self.revision.lower()):
+                    subprocess.check_call([ "git", "checkout", "-f", self.revision ])
+
+            if not self.revision:
+                self.revision = head
+
+            # Retrieve information about our base branch and master (for bots/)
+            if self.base and not opts.offline:
+                subprocess.check_call([ "git", "fetch", "origin", self.base, "master" ])
+
+            # Clean out the test directory
+            subprocess.check_call([ "git", "clean", "-d", "--force", "--quiet", "-x", "--", "test/" ])
+
+            os.environ["TEST_NAME"] = self.name
+            os.environ["TEST_REVISION"] = self.revision
+
+        # Split a value like verify/fedora-24
+        (prefix, unused, value) = self.context.partition("/")
+
+        if prefix in [ 'selenium' ]:
+            image = 'fedora-24'
+        elif prefix in [ 'container' ]:
+            image = 'fedora-25'
+        else:
+            image = value
+        os.environ["TEST_OS"] = image
+
+        if opts.publish:
+            self.start_publishing(opts.publish)
+            os.environ["TEST_ATTACHMENTS"] = self.sink.attachments
+
+        msg = "Testing {0} for {1} with {2} on {3}...\n".format(self.revision, self.name,
+                                                                self.context, HOSTNAME)
+        sys.stderr.write(msg)
+
+        ret = None
+
+        # If a respawn then this is aleady done
+        if "TEST_INVOKE_RESPAWN" not in os.environ:
+            if self.base:
+                ret = self.rebase()
+
+        test = os.path.join(BOTS, "..", "test")
+
+        # Figure out what to do next
+        if prefix == "verify":
+            cmd = [ "timeout", "120m", os.path.join(test, "verify", "run-tests"),
+                    "--jobs", str(opts.jobs) ]
+        elif prefix == "avocado":
+            cmd = [ "timeout", "60m", os.path.join(test, "avocado", "run-tests"),
+                    "--quick", "--tests" ]
+        elif prefix == "selenium":
+            if value not in ['firefox', 'chrome', 'explorer']:
+                ret = "Unknown browser for selenium test"
+            cmd = [ "timeout", "60m", os.path.join(test, "avocado", "run-tests"),
+                    "--quick", "--selenium-tests", "--browser", value]
+        elif prefix == "image" or prefix == "container":
+            cmd = [ "timeout", "90m", os.path.join(test, "containers", "run-tests"),
+                    "--container", value]
+        else:
+            ret = "Unknown context"
+
+
+        env = os.environ.copy()
+        # COMPAT: we can only use the cache for new enough branches which have the test/bots split;
+        # don't destroy the old test/images symlink farm
+        if "TEST_DATA" in env and subprocess.call(['git', 'ls-tree', '-d', 'HEAD:bots/images'],
+                                                  stdout=DEVNULL, stderr=DEVNULL) != 0:
+            del env["TEST_DATA"]
+        env["PATH"] = "{0}:{1}:{2}".format(env.get("PATH", "/bin:/sbin"), BOTS, test)
+
+        # Setup network if necessary, any failures caught during testing
+        prep = os.path.join(BASE, "test", "vm-prep")
+        if os.path.exists(prep):
+            subprocess.call(["sudo", "-n", prep ], env=env)
+
+        # Prepare the image to run
+        if not ret:
+            ret = self.prepare(prefix, value, image, opts.verbose)
+
+        # Actually run the tests
+        if not ret:
+            if opts.verbose:
+                cmd.append("--verbose")
+            ret = subprocess.call(cmd, env=env)
+
+        # All done
+        if self.sink:
+            ret = self.stop_publishing(ret)
+
+        return ret
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,4 +1,4 @@
-@import (less) "../../../bower_components/registry-image-widgets/dist/image-widgets.css";
+@import (less) "../../../node_modules/registry-image-widgets/dist/image-widgets.css";
 
 @tag-border: @link-color;
 
@@ -8,14 +8,6 @@ table.images-listing {
 
     tbody:hover {
         background-color: #d4edfa;
-    }
-
-    tbody.open .listing-ct-panel .listing-ct-body {
-        border-right: 1px solid #ccc;
-    }
-
-    tbody.open tr.listing-ct-panel td div.listing-ct-head {
-        border-right: 1px solid #ccc;
     }
 
     thead {
@@ -64,5 +56,11 @@ table.images-listing {
 
     tr.listing-ct-item tt {
         color: @metadata-color;
+    }
+}
+
+registry-imagestream-listing {
+    table.listing-ct {
+        margin-top: -15px;
     }
 }

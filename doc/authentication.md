@@ -55,7 +55,7 @@ The given value should be a number between 1 and 900.
 
 An error response should contain the following fields:
 
- * error: Values of ```authentication-failed```, ```authentication-unavailable``` or ```permission-denied``` are translated to the appropriate cockpit error codes. Any other values are treated as generic errors
+ * problem: Values of ```authentication-failed```, ```authentication-unavailable``` or ```access-denied``` are translated to the appropriate cockpit error codes. Any other values are treated as generic errors
  * message: Optional text with more details about the error.
 
 A successful response must contain a ```user``` field with the user
@@ -112,7 +112,6 @@ Environment Variables
 The following environment variables are set by cockpit-ws when spawning an auth process
 
  * **COCKPIT_REMOTE_PEER** Set to the ip address of the connecting user.
- * **COCKPIT_AUTH_MESSAGE_TYPE** A string representing the type of message that will be sent on the authentication fd. When the message is passed durning login, this will be set to the value of the auth scheme that was included in the Authorization http header.
 
 The following environment variables are used to set options for the ```cockpit-ssh``` process.
 
@@ -120,5 +119,4 @@ The following environment variables are used to set options for the ```cockpit-s
  * **COCKPIT_SSH_KNOWN_HOSTS_FILE** Path to knownhost files. Defaults to ```PACKAGE_SYSCONF_DIR/ssh/ssh_known_hosts```
  * **COCKPIT_SSH_KNOWN_HOSTS_DATA** Known host data to validate against or '*' to skip validation```
  * **COCKPIT_SSH_BRIDGE_COMMAND** Command to launch after a ssh connection is established. Defaults to ```cockpit-bridge``` if not provided.
- * **COCKPIT_SSH_SUPPORTS_HOST_KEY_PROMPT** Set to ```1``` if caller supports prompting users for unknown host keys.
  * **KRB5CCNAME** Kerberos credentials cache name. Not set when no active kerberos session is active.

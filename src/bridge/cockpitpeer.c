@@ -21,7 +21,9 @@
 
 #include "cockpitpeer.h"
 
+#include "common/cockpitauthorize.h"
 #include "common/cockpitjson.h"
+#include "common/cockpitmemory.h"
 #include "common/cockpittransport.h"
 #include "common/cockpitpipe.h"
 #include "common/cockpitpipetransport.h"
@@ -42,6 +44,7 @@ struct _CockpitPeer {
   /* Our bridge configuration */
   const gchar *name;
   JsonObject *config;
+  guint timeout;
 
   /* The channels we're dealing with */
   GHashTable *channels;
@@ -49,6 +52,12 @@ struct _CockpitPeer {
 
   /* Authorizations going on */
   GHashTable *authorizes;
+
+  /* authorize types we will reply to */
+  GHashTable *authorize_values;
+
+  /* first_host */
+  gchar *init_host;
 
   /* The transport we're routing from */
   CockpitTransport *transport;
@@ -64,6 +73,7 @@ struct _CockpitPeer {
   gboolean inited;
   gboolean closed;
   gchar *problem;
+  JsonObject *failure;
 };
 
 enum {
@@ -76,21 +86,42 @@ G_DEFINE_TYPE (CockpitPeer, cockpit_peer, G_TYPE_OBJECT);
 
 static void
 reply_channel_closed (CockpitPeer *self,
-                      const gchar *channel)
+                      const gchar *channel,
+                      const gchar *problem)
 {
   JsonObject *object;
   GBytes *message;
+  GList *l, *names;
 
   object = json_object_new ();
+
+  /* Copy over any failures from a "problem" in an "init" message */
+  if (self->failure)
+    {
+      names = json_object_get_members (self->failure);
+      for (l = names; l != NULL; l = g_list_next (l))
+        json_object_set_member (object, l->data, json_object_dup_member (self->failure, l->data));
+      g_list_free (names);
+    }
+
   json_object_set_string_member (object, "command", "close");
   json_object_set_string_member (object, "channel", channel);
-  json_object_set_string_member (object, "problem", self->problem);
+  json_object_set_string_member (object, "problem", problem);
 
   message = cockpit_json_write_bytes (object);
   cockpit_transport_send (self->transport, NULL, message);
 
   json_object_unref (object);
   g_bytes_unref (message);
+}
+
+static void
+clear_authorize_value (gpointer pointer)
+{
+  char *data = pointer;
+  if (data)
+    cockpit_memory_clear (data, -1);
+  g_free (data);
 }
 
 static gboolean
@@ -111,6 +142,21 @@ on_other_recv (CockpitTransport *transport,
 }
 
 static gboolean
+on_timeout_reset (gpointer user_data)
+{
+  CockpitPeer *self = user_data;
+
+  self->timeout = 0;
+  if (g_hash_table_size (self->channels) == 0)
+    {
+      g_debug ("%s: peer timed out without channels", self->name);
+      cockpit_peer_reset (self);
+    }
+
+  return FALSE;
+}
+
+static gboolean
 on_other_control (CockpitTransport *transport,
                   const char *command,
                   const gchar *channel,
@@ -118,17 +164,35 @@ on_other_control (CockpitTransport *transport,
                   GBytes *payload,
                   gpointer user_data)
 {
-  static const gchar *default_init = "{ \"command\": \"init\", \"version\": 1, \"host\": \"localhost\" }";
+  gchar *default_init = NULL;
   CockpitPeer *self = user_data;
   const gchar *problem = NULL;
   const gchar *cookie = NULL;
+  const gchar *challenge = NULL;
+  GBytes *reply;
+  gint64 timeout;
   gint64 version;
+  char *type = NULL;
   GList *l;
 
   /* Got an init message thaw all channels */
   if (g_str_equal (command, "init"))
     {
-      if (!cockpit_json_get_int (options, "version", -1, &version))
+      g_hash_table_remove_all (self->authorize_values);
+
+      if (!cockpit_json_get_string (options, "problem", NULL, &problem))
+        {
+          g_warning ("%s: invalid \"problem\" field in init message", self->name);
+          problem = "protocol-error";
+        }
+      else if (problem)
+        {
+          if (self->failure)
+            json_object_unref (self->failure);
+          self->failure = json_object_ref (options);
+          json_object_remove_member (self->failure, "version");
+        }
+      else if (!cockpit_json_get_int (options, "version", -1, &version))
         {
           g_warning ("%s: invalid \"version\" field in init message", self->name);
           problem = "protocol-error";
@@ -155,7 +219,11 @@ on_other_control (CockpitTransport *transport,
           self->inited = TRUE;
 
           if (!self->last_init)
-            self->last_init = g_bytes_new_static (default_init, strlen (default_init));
+            {
+              default_init = g_strdup_printf ("{ \"command\": \"init\", \"version\": 1, \"host\": \"%s\" }",
+                                       self->init_host ? self->init_host : "localhost");
+              self->last_init = g_bytes_new_take (default_init, strlen (default_init));
+            }
           cockpit_transport_send (transport, NULL, self->last_init);
 
           if (self->frozen)
@@ -175,6 +243,22 @@ on_other_control (CockpitTransport *transport,
         {
           g_message ("%s: received \"authorize\" request without a valid cookie", self->name);
         }
+
+      /* If we have info we can respond to basic authorize challenges */
+      else if (cockpit_json_get_string (options, "challenge", NULL, &challenge) &&
+               challenge && g_hash_table_contains (self->authorize_values, challenge))
+        {
+          reply = cockpit_transport_build_control ("command", "authorize",
+                                                   "cookie", cookie,
+                                                   "response",
+                                                   g_hash_table_lookup (self->authorize_values, challenge),
+                                                   NULL);
+          g_hash_table_remove (self->authorize_values, challenge);
+          cockpit_transport_send (transport, NULL, reply);
+          g_bytes_unref (reply);
+        }
+
+      /* Otherwise forward the authorize challenge on */
       else
         {
           g_hash_table_add (self->authorizes, g_strdup (cookie));
@@ -194,22 +278,44 @@ on_other_control (CockpitTransport *transport,
     {
       /* Stop keeping track of channels that are closed */
       if (g_str_equal (command, "close"))
-        g_hash_table_remove (self->channels, channel);
+        {
+          g_hash_table_remove (self->channels, channel);
+          if (g_hash_table_size (self->channels) == 0)
+            {
+              g_debug ("%s: removed last channel for peer", self->name);
+              if (self->timeout)
+                g_source_remove (self->timeout);
+              self->timeout = 0;
+              if (cockpit_json_get_int (self->config, "timeout", -1, &timeout) && timeout >= 0)
+                self->timeout = g_timeout_add_seconds (timeout, on_timeout_reset, self);
+            }
+        }
 
       /* All control messages with a channel get forwarded */
       cockpit_transport_send (self->transport, NULL, payload);
     }
 
+  g_free (type);
   return TRUE;
 }
 
 static const gchar *
 fail_start_problem (CockpitPeer *self)
 {
-  const gchar *problem;
+  const gchar *problem = NULL;
 
-  if (!cockpit_json_get_string (self->config, "problem", NULL, &problem))
-    problem = NULL;
+  /* This might be a "problem" in an "init" message from other bridge */
+  if (self->failure)
+    {
+      if (!cockpit_json_get_string (self->failure, "problem", NULL, &problem))
+        problem = NULL;
+    }
+
+  if (!problem)
+    {
+      if (!cockpit_json_get_string (self->config, "problem", NULL, &problem))
+        problem = NULL;
+    }
 
   g_free (self->problem);
   self->problem = g_strdup (problem);
@@ -227,6 +333,7 @@ on_other_closed (CockpitTransport *transport,
   GList *l, *channels;
   CockpitPipe *pipe;
   gint status = 0;
+  gint64 timeout;
 
   /*
    * If we haven't yet gotten an "init" message, then we use the
@@ -300,7 +407,7 @@ on_other_closed (CockpitTransport *transport,
        * all yet. See above. In these cases we close the channel.
        */
       if (problem)
-        reply_channel_closed (self, channel);
+        reply_channel_closed (self, channel, problem);
 
       /*
        * When we don't have a problem code we want this channel
@@ -312,6 +419,10 @@ on_other_closed (CockpitTransport *transport,
       cockpit_transport_thaw (self->transport, channel);
     }
   g_list_free_full (channels, g_free);
+
+  /* If the timeout is set, then expect that this bridge can cycle back up */
+  if (cockpit_json_get_int (self->config, "timeout", -1, &timeout) && timeout >= 0)
+    cockpit_peer_reset (self);
 }
 
 static gboolean
@@ -387,6 +498,8 @@ cockpit_peer_init (CockpitPeer *self)
 {
   self->channels = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   self->authorizes = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  self->authorize_values = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                  NULL, clear_authorize_value);
 }
 
 static void
@@ -438,9 +551,8 @@ cockpit_peer_dispose (GObject *object)
 {
   CockpitPeer *self = COCKPIT_PEER (object);
 
+  cockpit_peer_reset (self);
   self->closed = TRUE;
-
-  g_hash_table_remove_all (self->channels);
 
   if (self->transport_recv)
     {
@@ -453,12 +565,6 @@ cockpit_peer_dispose (GObject *object)
       self->transport_control = 0;
     }
 
-  if (self->other)
-    cockpit_transport_close (self->other, "terminated");
-  if (self->other)
-    on_other_closed (self->other, "terminated", self);
-  g_assert (self->other == NULL);
-
   G_OBJECT_CLASS (cockpit_peer_parent_class)->dispose (object);
 }
 
@@ -469,6 +575,7 @@ cockpit_peer_finalize (GObject *object)
 
   g_hash_table_destroy (self->channels);
   g_hash_table_destroy (self->authorizes);
+  g_hash_table_destroy (self->authorize_values);
 
   if (self->config)
     json_object_unref (self->config);
@@ -476,10 +583,9 @@ cockpit_peer_finalize (GObject *object)
     g_object_unref (self->transport);
   if (self->last_init)
     g_bytes_unref (self->last_init);
-  if (self->frozen)
-    g_queue_free_full (self->frozen, g_free);
 
   g_free (self->problem);
+  g_free (self->init_host);
 
   G_OBJECT_CLASS (cockpit_peer_parent_class)->finalize (object);
 }
@@ -664,6 +770,11 @@ cockpit_peer_handle (CockpitPeer *self,
                      JsonObject *options,
                      GBytes *data)
 {
+  const gchar *user = NULL;
+  const gchar *password = NULL;
+  const gchar *host = NULL;
+  const gchar *host_key = NULL;
+
   g_return_val_if_fail (COCKPIT_IS_PEER (self), FALSE);
   g_return_val_if_fail (channel != NULL, FALSE);
   g_return_val_if_fail (options != NULL, FALSE);
@@ -679,7 +790,7 @@ cockpit_peer_handle (CockpitPeer *self,
         {
           g_debug ("%s: closing channel \"%s\" with \"%s\" because peer closed",
                    self->name, channel, self->problem);
-          reply_channel_closed (self, channel);
+          reply_channel_closed (self, channel, self->problem);
           return TRUE;
         }
 
@@ -688,7 +799,36 @@ cockpit_peer_handle (CockpitPeer *self,
       return FALSE;
     }
 
+  /* If this is the first channel, we can cache data from it */
+  if (!self->inited)
+    {
+      if (!self->init_host && cockpit_json_get_string (options, "host", NULL, &host))
+        self->init_host = g_strdup (host);
+
+      /* Setup authorize_values
+       * TODO: Should this be configurable?
+       */
+      if (cockpit_json_get_string (options, "user", NULL, &user) &&
+          cockpit_json_get_string (options, "password", NULL, &password) && password)
+        {
+          g_hash_table_insert (self->authorize_values, "basic",
+                               cockpit_authorize_build_basic (user, password));
+        }
+
+      if (cockpit_json_get_string (options, "host-key", NULL, &host_key))
+        {
+          g_hash_table_insert (self->authorize_values, "x-host-key",
+                               host_key ? g_strdup_printf ("x-host-key %s", host_key) : g_strdup (""));
+        }
+    }
+
   g_hash_table_add (self->channels, g_strdup (channel));
+
+  if (self->timeout)
+    {
+      g_source_remove (self->timeout);
+      self->timeout = 0;
+    }
 
   /* If already inited send the message through */
   if (self->inited)
@@ -746,4 +886,39 @@ cockpit_peer_ensure (CockpitPeer *self)
     }
 
   return self->other;
+}
+
+void
+cockpit_peer_reset (CockpitPeer *self)
+{
+  if (self->timeout)
+    {
+      g_source_remove (self->timeout);
+      self->timeout = 0;
+    }
+
+  if (self->other)
+    cockpit_transport_close (self->other, "terminated");
+  if (self->other)
+    on_other_closed (self->other, "terminated", self);
+  g_assert (self->other == NULL);
+
+  if (self->frozen)
+    g_queue_free_full (self->frozen, g_free);
+  self->frozen = NULL;
+
+  g_hash_table_remove_all (self->channels);
+  g_hash_table_remove_all (self->authorizes);
+  g_hash_table_remove_all (self->authorize_values);
+
+  if (self->failure)
+    {
+      json_object_unref (self->failure);
+      self->failure = NULL;
+    }
+
+  g_free (self->problem);
+  self->problem = NULL;
+  self->closed = FALSE;
+  self->inited = FALSE;
 }

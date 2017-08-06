@@ -1,0 +1,193 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# This file is part of Cockpit.
+#
+# Copyright (C) 2013 Red Hat, Inc.
+#
+# Cockpit is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation; either version 2.1 of the License, or
+# (at your option) any later version.
+#
+# Cockpit is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Cockpit; If not, see <http://www.gnu.org/licenses/>.
+
+CONFIG = "~/.config/image-stores"
+DEFAULT = [
+    "https://209.132.184.69:8493/",
+    "https://209.132.184.41:8493/",
+    "http://cockpit-images.verify.svc.cluster.local",
+    "https://fedorapeople.org/groups/cockpit/images/"
+]
+
+# Days after which images expire if not in use
+IMAGE_EXPIRE = 14
+
+import argparse
+import os
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import urlparse
+
+BOTS = os.path.dirname(os.path.realpath(__file__))
+IMAGES = os.path.join(BOTS, "..", "bots", "images")
+DATA = os.path.join(os.environ.get("TEST_DATA", BOTS), "images")
+
+DEVNULL = open("/dev/null", "r+")
+
+def download(link, force, quiet, stores):
+    if not os.path.exists(DATA):
+        os.makedirs(DATA)
+
+    dest = os.readlink(link)
+    relative_dir = os.path.dirname(os.path.abspath(link))
+    full_dest = os.path.join(relative_dir, dest)
+    while not ".qcow2" in dest and os.path.islink(full_dest):
+        link = full_dest
+        dest = os.readlink(link)
+        relative_dir = os.path.dirname(os.path.abspath(link))
+        full_dest = os.path.join(relative_dir, dest)
+
+    dest = os.path.join(DATA, dest)
+
+    # we have the file but there is not valid link
+    if os.path.exists(dest) and not os.path.exists(link):
+        os.symlink(dest, os.path.join(IMAGES, os.readlink(link)))
+
+    # The image file in the images directory, may be same as dest
+    image_file = os.path.join(IMAGES, os.readlink(link))
+
+    # file already exists, double check that symlink in place
+    if not force and os.path.exists(dest):
+        if not os.path.exists(image_file):
+            os.symlink(os.path.abspath(dest), image_file)
+        return
+
+    if not stores:
+        config = os.path.expanduser(CONFIG)
+        if os.path.exists(config):
+            with open(config, 'r') as fp:
+                stores = fp.read().strip().split("\n")
+        else:
+            stores = []
+        stores += DEFAULT
+
+    name = os.path.basename(dest)
+    ca = os.path.join(BOTS, "images", "files", "ca.pem")
+    for store in stores:
+        url = urlparse.urlparse(store)
+
+        defport = url.scheme == 'http' and 80 or 443
+
+        try:
+            ai = socket.getaddrinfo(url.hostname, url.port or defport, socket.AF_INET, 0, socket.IPPROTO_TCP)
+        except socket.gaierror:
+            ai = [ ]
+            message = store
+
+        for (family, socktype, proto, canonname, sockaddr) in ai:
+            resolve = "cockpit-tests:{1}:{0}".format(*sockaddr)
+            source = urlparse.urljoin("{0}://cockpit-tests:{1}{2}".format(url.scheme, sockaddr[1], url.path), name)
+            message = "{scheme}://{0}:{1}{path}".format(*sockaddr, scheme=url.scheme, path=url.path)
+
+            try:
+                cmd = ["curl", "--head", "--silent",  "--resolve", resolve, "--fail", "--cacert", ca, source]
+                subprocess.check_call(cmd, stdout=DEVNULL)
+                break
+            except subprocess.CalledProcessError:
+                pass
+            try:
+                cmd = ["curl", "--head", "--silent", "--fail", source]
+                subprocess.check_call(cmd, stdout=DEVNULL)
+                break
+            except subprocess.CalledProcessError:
+                pass
+
+
+        # If the above block found nothing, then continue with next store
+        else:
+            if not quiet:
+                sys.stderr.write(" x {0}\n".format(message))
+            continue
+
+        # If the above block found something then break out here too
+        if not quiet:
+            sys.stderr.write(" > {0}\n".format(urlparse.urljoin(message, name)))
+        break
+
+    (fd, temp) = tempfile.mkstemp(suffix=".partial", prefix=os.path.basename(dest), dir=os.path.dirname(dest))
+
+    # Adjust the command above that worked to make it visible and download real stuff
+    cmd.remove("--head")
+    if not quiet:
+        cmd.remove("--silent")
+        cmd.insert(1, "--progress-bar")
+    cmd.append("--output")
+    cmd.append(temp)
+    os.close(fd)
+
+    try:
+        curl = subprocess.Popen(cmd)
+        ret = curl.wait()
+        if ret != 0:
+            real_url = urlparse.urljoin("{0}://{1}:{2}{3}".format(url.scheme, sockaddr[0], sockaddr[1], url.path), name)
+            raise Exception("curl: unable to download %s (returned: %s)" % (real_url, ret))
+
+        os.chmod(temp, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        shutil.move(temp, dest)
+    finally:
+        # if we had an error and the temp file is left over, delete it
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+    # Handle alternate TEST_DATA
+    if not os.path.exists(image_file):
+        os.symlink(os.path.abspath(dest), image_file)
+
+def every_image():
+    result = []
+    for filename in os.listdir(IMAGES):
+        link = os.path.join(IMAGES, filename)
+        if os.path.islink(link):
+            result.append(filename)
+    return result
+
+def download_images(image_list, force, quiet, store):
+    for image in image_list:
+        link = os.path.join(IMAGES, image)
+        if not os.path.islink(link):
+            raise RuntimeError("image link does not exist: " + image)
+        download(link, force, quiet, store)
+
+def main():
+    parser = argparse.ArgumentParser(description='Download a virtual machine')
+    parser.add_argument("--force", action="store_true", help="Force unnecessary downloads")
+    parser.add_argument("--store", action="append", help="Where to find images")
+    parser.add_argument("--quiet", action="store_true", help="Make downloading quieter")
+    parser.add_argument('image', nargs='*')
+    args = parser.parse_args()
+
+    # By default download all links
+    if not args.image:
+        args.image = every_image()
+
+    try:
+        download_images(args.image, args.force, args.quiet, args.store)
+    except RuntimeError, ex:
+        sys.stderr.write("image-download: {0}\n".format(str(ex)))
+        return 1
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

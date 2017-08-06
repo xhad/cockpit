@@ -65,7 +65,7 @@
     ]);
 
     var NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
-    var USER_NAME_RE = /^[a-z0-9_.]([-a-z0-9@._]*[a-z0-9._])?$/;
+    var USER_NAME_RE = /^[a-zA-Z0-9_.]([-a-zA-Z0-9 ,=@._]*[a-zA-Z0-9._])?$/;
 
     /* Timeout for non-GET requests */
     var REQ_TIMEOUT = "120s";
@@ -273,9 +273,6 @@
 
         /*
          * Combine into a path.
-         *
-         * Kubernetes names and namespaces are quite limited in their contents
-         * and do not need escaping to be used in a URI path.
          */
         var schema = SCHEMA[args[0]] || SCHEMA[""];
         var path = schema.api;
@@ -283,7 +280,8 @@
             path += "/namespaces/" + args[2];
         path += "/" + schema.type;
         if (args[1])
-            path += "/" + args[1];
+            path += "/" + encodeURIComponent(args[1]);
+
         return path;
     }
 
@@ -486,9 +484,10 @@
                 for (i = 0, len = drain.length; i < len; i++) {
                     resource = drain[i].object;
                     if (resource) {
-                        link = resourcePath([resource]);
+                        link = decodeURIComponent(resourcePath([resource]));
                         if (drain[i].type == "DELETED") {
                             delete objects[link];
+                            delete present[link];
                             removed[link] = resource;
                         } else if (drain[i].checkResourceVersion) {
                             /* There is a race between items loaded from
@@ -1321,7 +1320,11 @@
                         if (!meta.name)
                             ex = new Error("The name cannot be empty");
                         else if (!check_re.test(meta.name))
-                            ex = new Error("The name contains invalid characters");
+                            if (check_re == NAME_RE) {
+                                ex = new Error("The name contains invalid characters. Only letters, numbers and dashes are allowed");
+                            } else {
+                                ex = new Error("The name contains invalid characters. Only letters, numbers, spaces and the following symbols are allowed: , = @  . _");
+                            }
                     }
                     if (ex) {
                         ex.target = targets["metadata.name"];
@@ -1333,7 +1336,7 @@
                         if (!meta.namespace)
                             ex = new Error("The namespace cannot be empty");
                         else if (!NAME_RE.test(meta.namespace))
-                            ex = new Error("The name contains invalid characters");
+                            ex = new Error("The name contains invalid characters. Only letters, numbers and dashes are allowed");
                     }
                     if (ex) {
                         ex.target = targets["metadata.namespace"];

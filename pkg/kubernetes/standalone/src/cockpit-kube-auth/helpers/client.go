@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
 
 const CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -75,12 +76,14 @@ type Client struct {
 	host    string
 	version string
 
-	caData   string
-	insecure bool
+	caData           string
+	insecure         bool
 	requireOpenshift bool
+	isOpenshift      bool
 
 	userAPI string
-	client      *http.Client
+	client  *http.Client
+	creds   *Credentials
 }
 
 func doRequest(client *http.Client, method string, path string, auth string, body []byte) (*http.Response, error) {
@@ -132,35 +135,97 @@ func (self *Client) fetchVersion(authHeader string) error {
 	return nil
 }
 
-func (self *Client) guessUserData(creds *Credentials) error {
+func (self *Client) apiStatus(resource string, auth string) (int, error) {
+	path := fmt.Sprintf("%s/api/%s/%s", self.host, self.version, resource)
+	resp, rErr := doRequest(self.client, "GET", path, auth, nil)
+	if rErr != nil {
+		return 0, errors.New(fmt.Sprintf("Couldn't connect to api: %s", rErr))
+	}
+
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+func (self *Client) confirmBearerAuth(creds *Credentials) error {
+	// There are no bugs we have to work around here
+	// so just make sure we get a 200 or 401 to
+	// a namespace call
+
+	status, e := self.apiStatus("namespaces", creds.GetHeader())
+	if e == nil && status != 403 && status != 200 {
+		newAuthError(fmt.Sprintf("Couldn't verify bearer token with api: %s", status))
+	}
+
+	return e
+}
+
+func (self *Client) confirmBasicAuth(creds *Credentials) error {
+	// Issue a request to the the /api API endpoint without any
+	// auth data.
+	// If we get 401 in response then we know our creds were good and we can log the user in.
+	// If we get a 200 or a 403 then we don't know if are creds were correct and we need to
+	// make more calls to figure it out.
+	// Any other code is treated as an error.
+	var e error
+	var status int
+	status, e = self.apiStatus("", "")
+	success := status == 401
+
+	if status == 200 || status == 403 {
+		// Either /api is open or the current user, possibly (system:anonymous)
+		// doesn't have permissions on it
+		// Send a request to the /api/$version/namespaces endpoint with a
+		// Authorization header that is guarenteed to be invalid.
+		// This should return a 200 if the whole api is open or a 401 if the
+		// api is protected.
+		status, e = self.apiStatus("namespaces", "Basic")
+
+		// Some versions of kubernetes return 403 instead of 401
+		// when presented with bad basic auth data. In those cases
+		// we need to refuse authentication, as we have no way
+		// know if the credentials we have are in fact valid.
+		// https://github.com/kubernetes/kubernetes/pull/41775
+		if status == 403 {
+			e = errors.New("This version of kubernetes is not supported. Turn off anonymous auth or upgrade.")
+		} else if status == 200 || status == 401 {
+			success = true
+		}
+	}
+
+	if !success && e == nil {
+		e = newAuthError(fmt.Sprintf("Couldn't verify authentication with api: %s", status))
+	}
+
+	return e
+}
+
+func (self *Client) confirmCreds(creds *Credentials) error {
 	// Do this explictly so that we know we have a valid response
 	// Kubernetes doesn't provide any way for a caller
-	// to find out who it is, so fill in the
-	// user as best we can.
+	// to find out who it is, so we need to confirm the creds
+	// we got some other way.
 	err := self.fetchVersion(creds.GetHeader())
 	if err != nil {
 		return err
 	}
 
-	// If the API is open make sure we don't have any credentials
-	// so we aren't just saying yes to everything
-	resp, e := self.DoRequest("GET", "api", "", nil, nil)
-
-	// Treat connection errors as internal errors and invalid
-	// responses as auth errors
-	if e != nil {
-		return errors.New(fmt.Sprintf("Couldn't connect to api: %s", e))
-	}
-
-	defer resp.Body.Close()
-	if resp.StatusCode != 401 && resp.StatusCode != 403 {
-		if (creds.authHeader != "") {
-			return newAuthError(fmt.Sprintf("Couldn't get api version: %s", resp.Status))
-		}
+	// If we are here we got a version for the api from the /api endpoint,
+	// using the credentials the user gave us.
+	// This happens when either
+	// a) /api is protected and the credentials are correct
+	// or
+	// b) /api is open in which case we have no idea if our creds were correct
+	// Confirming them is different for Basic or Bearer auth
+	var e error
+	if creds.UserName != "" {
+		e = self.confirmBasicAuth(creds)
+	} else {
+		creds.UserName = "Unknown"
+		e = self.confirmBearerAuth(creds)
 	}
 
 	creds.DisplayName = creds.UserName
-	return nil
+	return e
 }
 
 func (self *Client) fetchUserData(creds *Credentials) error {
@@ -171,19 +236,22 @@ func (self *Client) fetchUserData(creds *Credentials) error {
 
 	defer resp.Body.Close()
 
-	/*
-	 * If we got a 404 and this isn't token auth
-	 * we don't have any way to get a user object
-	 * so just make sure the api isn't open
-	 */
-	if resp.StatusCode == 404 && self.requireOpenshift {
+	// 404 or 403 are both responses we can
+	// get when the oapi/users endpoint doesn't exists
+	notFound := resp.StatusCode == 404 || resp.StatusCode == 403
+	if notFound && self.requireOpenshift {
 		return errors.New("Couldn't connect: Incompatible API")
-	} else if resp.StatusCode == 404 && creds.UserName != "" {
-		return self.guessUserData(creds)
+
+		// This might be kubernetes, it doesn't have a way to
+		// get user data, if we have a username try to
+		// see if we can connect to it anyways
+	} else if notFound {
+		return self.confirmCreds(creds)
 	} else if resp.StatusCode != 200 {
 		return newAuthError(fmt.Sprintf("Couldn't get user data: %s", resp.Status))
 	}
 
+	self.isOpenshift = true
 	data := userInfo{}
 	deErr := json.NewDecoder(resp.Body).Decode(&data)
 	if deErr != nil {
@@ -228,7 +296,16 @@ func (self *Client) DoRequest(method string, api string, resource string,
 	return resp, nil
 }
 
-func (self *Client) Login(authType string, authData string) ([]byte, error) {
+func (self *Client) Login(authLine string) (map[string]interface{}, error) {
+	parts := strings.SplitN(authLine, " ", 2)
+	if len(parts) == 0 {
+		return nil, newAuthError("Invalid Authorization line")
+	}
+	authData := ""
+	authType := parts[0]
+	if len(parts) == 2 {
+		authData = parts[1]
+	}
 
 	creds, err := NewCredentials(authType, authData)
 	if err == nil {
@@ -236,12 +313,14 @@ func (self *Client) Login(authType string, authData string) ([]byte, error) {
 	}
 
 	if err != nil {
-		if (creds.authType == "negotiate") {
+		if creds != nil && creds.authType == "negotiate" {
 			return nil, newAuthError(fmt.Sprintf("Negotiate failed: %s", err))
 		}
 		return nil, err
 	}
 
+	// Login successfull, save creds
+	self.creds = creds
 	user_data := creds.GetApiUserMap()
 	cluster := make(map[string]interface{})
 	cluster["server"] = self.host
@@ -268,10 +347,27 @@ func (self *Client) Login(authType string, authData string) ([]byte, error) {
 	login_data["contexts"] = contexts
 	login_data["users"] = users
 
-	data := make(map[string]interface{})
-	data["user"] = user_data["name"]
-	data["login-data"] = login_data
-	return json.Marshal(&data)
+	return login_data, nil
+}
+
+func (self *Client) CleanUp() error {
+	if self.creds != nil && self.isOpenshift {
+		token := self.creds.GetToken()
+		if token != "" {
+			path := fmt.Sprintf("oauthaccesstokens/%s", token)
+			resp, err := self.DoRequest("DELETE", self.userAPI, path, self.creds, nil)
+			if err != nil {
+				return err
+			}
+
+			if resp.StatusCode != 200 {
+				log.Println(fmt.Sprintf("Invalid token cleanup response: %d", resp.StatusCode))
+			}
+
+			defer resp.Body.Close()
+		}
+	}
+	return nil
 }
 
 func NewClient() *Client {

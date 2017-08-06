@@ -263,10 +263,23 @@ on_handle_mock (CockpitWebServer *server,
 static CockpitWebService *service;
 static CockpitPipe *bridge;
 
+static void
+on_init_ready (GObject *object,
+               GAsyncResult *result,
+               gpointer data)
+{
+  gboolean *flag = data;
+  g_assert (*flag == FALSE);
+  cockpit_web_service_get_init_message_finish (COCKPIT_WEB_SERVICE (object),
+                                               result);
+  *flag = TRUE;
+}
+
 static gboolean
 on_handle_stream_socket (CockpitWebServer *server,
                          const gchar *original_path,
                          const gchar *path,
+                         const gchar *method,
                          GIOStream *io_stream,
                          GHashTable *headers,
                          GByteArray *input,
@@ -278,6 +291,7 @@ on_handle_stream_socket (CockpitWebServer *server,
   int session_stdin = -1;
   int session_stdout = -1;
   GError *error = NULL;
+  gboolean ready = FALSE;
   GPid pid = 0;
 
   gchar *value;
@@ -332,12 +346,20 @@ on_handle_stream_socket (CockpitWebServer *server,
                              "pid", pid,
                              NULL);
 
-      creds = cockpit_creds_new (g_get_user_name (), "test",
+      creds = cockpit_creds_new ("test",
                                  COCKPIT_CRED_CSRF_TOKEN, "myspecialtoken",
                                  NULL);
 
       transport = cockpit_pipe_transport_new (bridge);
       service = cockpit_web_service_new (creds, transport);
+      /* Manually created services won't be init'd yet,
+       * wait for that before sending data
+       */
+      cockpit_web_service_get_init_message_aysnc (service, on_init_ready, &ready);
+
+      while (!ready)
+        g_main_context_iteration (NULL, TRUE);
+
       cockpit_creds_unref (creds);
       g_object_unref (transport);
 
@@ -383,6 +405,7 @@ static gboolean
 on_handle_stream_external (CockpitWebServer *server,
                            const gchar *original_path,
                            const gchar *path,
+                           const gchar *method,
                            GIOStream *io_stream,
                            GHashTable *headers,
                            GByteArray *input,
@@ -466,6 +489,7 @@ on_handle_stream_external (CockpitWebServer *server,
           else
             {
               response = cockpit_web_response_new (io_stream, path, path, NULL, headers);
+              cockpit_web_response_set_method (response, method);
               cockpit_channel_response_open (service, headers, response, open);
               g_object_unref (response);
               handled = TRUE;
@@ -834,7 +858,7 @@ main (int argc,
   bridge_argv = g_new0 (char *, argc + 2);
   for (i = 0; i < argc; i++)
     bridge_argv[i] = argv[i];
-  bridge_argv[i] = "cockpit-bridge";
+  bridge_argv[i] = BUILDDIR "/cockpit-bridge";
 
   // Use a local ssh session command
   cockpit_ws_ssh_program = BUILDDIR "/cockpit-ssh";

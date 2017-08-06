@@ -23,8 +23,7 @@
     var angular = require('angular');
     require('angular-route');
     require('angular-gettext/dist/angular-gettext.js');
-    require('angular-bootstrap/ui-bootstrap.js');
-    require('angular-bootstrap/ui-bootstrap-tpls.js');
+    require('angular-bootstrap-npm/dist/angular-bootstrap.js');
 
     require('./app');
     require('./date');
@@ -49,6 +48,7 @@
         'registry.images',
         'registry.projects',
         'registry.policy',
+        'registryUI.date',
         'kubeClient',
         'kubeClient.cockpit'
     ])
@@ -58,9 +58,10 @@
         'KubeWatchProvider',
         'KubeRequestProvider',
         'KubeDiscoverSettingsProvider',
+        'MomentLibProvider',
         '$provide',
         function($routeProvider, KubeWatchProvider, KubeRequestProvider,
-                 KubeDiscoverSettingsProvider, $provide) {
+                 KubeDiscoverSettingsProvider, MomentLibProvider, $provide) {
 
             $routeProvider
                 .when('/', {
@@ -74,6 +75,7 @@
             KubeWatchProvider.KubeWatchFactory = "CockpitKubeWatch";
             KubeRequestProvider.KubeRequestFactory = "CockpitKubeRequest";
             KubeDiscoverSettingsProvider.KubeDiscoverSettingsFactory = "cockpitKubeDiscoverSettings";
+            MomentLibProvider.MomentLibFactory = "momentLib";
 
             $provide.decorator("$exceptionHandler",
                 ['$delegate',
@@ -187,7 +189,7 @@
             };
 
             $scope.projects = function projects() {
-                return select().kind("Project");
+                return select().kind("Project").statusPhase("Active");
             };
 
             $scope.filter = filter;

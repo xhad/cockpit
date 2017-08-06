@@ -18,6 +18,7 @@
 Makefile
 Makefile.in
 /stamp-h1
+/tmp/
 missing
 /libtool
 cockpit-polkit
@@ -53,7 +54,6 @@ depcomp
 /cockpit.service
 /cockpit-wrapper
 /bower_components/*
-!/bower_components/README
 /node_modules/*
 !/node_modules/README
 /test-server
@@ -83,6 +83,7 @@ depcomp
 /tools/coverage.test
 /tools/test-driver
 /tools/compile
+/tools/debian/copyright
 /test-*
 /frob-*
 /mock-*
@@ -97,8 +98,12 @@ depcomp
 /src/selinux/cockpit.pp
 /pkg/*/test-*.log
 /pkg/*/test-*.trs
-/test/images/*.*
-/test/images/*-checksum
+/bots/images/*.qcow2
+/bots/images/*.partial
+/bots/images/*.xz
+/bots/images/*.img
+/test/images/*
+/test/verify/naughty-*/*
 /test/container-probe*
 /mock/
 *.min.html
@@ -163,6 +168,7 @@ po*.js.gz
 Test*.log
 cockpit-*.tar*
 Test*.png
+Test*.html
 
 /pkg/networkmanager/override.json
 /pkg/storaged/override.json

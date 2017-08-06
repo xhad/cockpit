@@ -19,10 +19,9 @@
 
 #include "config.h"
 
-#include "mock-auth.h"
-#include "cockpitws.h"
 #include "cockpitcreds.h"
 #include "cockpitwebservice.h"
+#include "cockpitws.h"
 
 #include "common/cockpitpipe.h"
 #include "common/cockpitpipetransport.h"
@@ -67,7 +66,6 @@ typedef struct {
   /* setup_mock_webserver */
   CockpitWebServer *web_server;
   gchar *cookie;
-  CockpitAuth *auth;
   CockpitCreds *creds;
 
   /* setup_io_pair */
@@ -85,6 +83,17 @@ typedef struct {
   const char *bridge;
 } TestFixture;
 
+static void
+on_init_ready (GObject *object,
+               GAsyncResult *result,
+               gpointer data)
+{
+  gboolean *flag = data;
+  g_assert (*flag == FALSE);
+  cockpit_web_service_get_init_message_finish (COCKPIT_WEB_SERVICE (object),
+                                               result);
+  *flag = TRUE;
+}
 
 static void
 setup_mock_bridge (TestCase *test,
@@ -129,18 +138,15 @@ setup_mock_webserver (TestCase *test,
                       gconstpointer data)
 {
   GError *error = NULL;
-  const gchar *user;
   GBytes *password;
 
   /* Zero port makes server choose its own */
   test->web_server = cockpit_web_server_new (NULL, 0, NULL, NULL, &error);
   g_assert_no_error (error);
 
-  user = g_get_user_name ();
-  test->auth = mock_auth_new (user, PASSWORD);
-
   password = g_bytes_new_take (g_strdup (PASSWORD), strlen (PASSWORD));
-  test->creds = cockpit_creds_new (user, "cockpit",
+  test->creds = cockpit_creds_new ("cockpit",
+                                   COCKPIT_CRED_USER, "me",
                                    COCKPIT_CRED_PASSWORD, password,
                                    COCKPIT_CRED_CSRF_TOKEN, "my-csrf-token",
                                    NULL);
@@ -154,7 +160,6 @@ teardown_mock_webserver (TestCase *test,
   g_clear_object (&test->web_server);
   if (test->creds)
     cockpit_creds_unref (test->creds);
-  g_clear_object (&test->auth);
   g_free (test->cookie);
 }
 
@@ -391,6 +396,8 @@ start_web_service_and_create_client (TestCase *test,
 {
   cockpit_config_file = fixture ? fixture->config : NULL;
   const char *origin = fixture ? fixture->origin : NULL;
+  gboolean ready = FALSE;
+
   if (!origin)
     origin = "http://127.0.0.1";
 
@@ -409,6 +416,13 @@ start_web_service_and_create_client (TestCase *test,
   cockpit_ws_default_protocol_header = fixture ? fixture->forward : NULL;
 
   *service = cockpit_web_service_new (test->creds, test->mock_bridge);
+  /* Manually created services won't be init'd yet,
+   * wait for that before sending data
+   */
+  cockpit_web_service_get_init_message_aysnc (*service, on_init_ready, &ready);
+
+  while (!ready)
+    g_main_context_iteration (NULL, TRUE);
 
   /* Note, we are forcing the websocket to parse its own headers */
   cockpit_web_service_socket (*service, "/unused", test->io_b, NULL, NULL);
@@ -1268,7 +1282,7 @@ test_authorize_password (TestCase *test,
   control = NULL;
 
   /* Now clear the password */
-  send_control_message (ws, "authorize", NULL, "credential", "password", NULL);
+  send_control_message (ws, "authorize", NULL, "response", "basic", NULL);
 
   /* We should now get a hint that we have no password */
   while (control == NULL)
@@ -1291,6 +1305,7 @@ test_parse_external (void)
 {
   const gchar *content_disposition;
   const gchar *content_type;
+  const gchar *content_encoding;
   gchar **protocols;
   JsonObject *object;
   JsonObject *external;
@@ -1299,21 +1314,23 @@ test_parse_external (void)
 
   object = json_object_new ();
 
-  ret = cockpit_web_service_parse_external (object, NULL, NULL, NULL);
+  ret = cockpit_web_service_parse_external (object, NULL, NULL, NULL, NULL);
   g_assert (ret == TRUE);
 
-  ret = cockpit_web_service_parse_external (object, &content_type, &content_disposition, &protocols);
+  ret = cockpit_web_service_parse_external (object, &content_type, &content_encoding, &content_disposition, &protocols);
   g_assert (ret == TRUE);
   g_assert (content_type == NULL);
+  g_assert (content_encoding == NULL);
   g_assert (content_disposition == NULL);
   g_assert (protocols == NULL);
 
   external = json_object_new ();
   json_object_set_object_member (object, "external", external);
 
-  ret = cockpit_web_service_parse_external (object, &content_type, &content_disposition, &protocols);
+  ret = cockpit_web_service_parse_external (object, &content_type, &content_encoding, &content_disposition, &protocols);
   g_assert (ret == TRUE);
   g_assert (content_type == NULL);
+  g_assert (content_encoding == NULL);
   g_assert (content_disposition == NULL);
   g_assert (protocols == NULL);
 
@@ -1324,11 +1341,13 @@ test_parse_external (void)
   json_object_set_array_member (external, "protocols", array);
 
   json_object_set_string_member (external, "content-type", "text/plain");
+  json_object_set_string_member (external, "content-encoding", "gzip");
   json_object_set_string_member (external, "content-disposition", "filename; test");
 
-  ret = cockpit_web_service_parse_external (object, &content_type, &content_disposition, &protocols);
+  ret = cockpit_web_service_parse_external (object, &content_type, &content_encoding, &content_disposition, &protocols);
   g_assert (ret == TRUE);
   g_assert_cmpstr (content_type, ==, "text/plain");
+  g_assert_cmpstr (content_encoding, ==, "gzip");
   g_assert_cmpstr (content_disposition, ==, "filename; test");
   g_assert (protocols != NULL);
   g_assert_cmpstr (protocols[0], ==, "one");
@@ -1338,6 +1357,35 @@ test_parse_external (void)
   g_free (protocols);
 
   json_object_unref (object);
+}
+
+static void
+test_host_checksums (void)
+{
+  CockpitTransport *transport = cockpit_pipe_transport_new_fds ("unused", 0, 0);
+  CockpitCreds *creds = cockpit_creds_new ("cockpit", NULL);
+  CockpitWebService *service = cockpit_web_service_new (creds, transport);
+  cockpit_web_service_set_host_checksum(service, "localhost", "checksum1");
+  cockpit_web_service_set_host_checksum(service, "host1", "checksum1");
+  cockpit_web_service_set_host_checksum(service, "host2", "checksum2");
+
+  g_assert_cmpstr (cockpit_web_service_get_host (service, "checksum1"), ==, "localhost");
+  g_assert_cmpstr (cockpit_web_service_get_host (service, "checksum2"), ==, "host2");
+  g_assert_cmpstr (cockpit_web_service_get_host (service, "bad"), ==, NULL);
+
+  g_assert_cmpstr (cockpit_web_service_get_checksum (service, "host1"), ==, "checksum1");
+  g_assert_cmpstr (cockpit_web_service_get_checksum (service, "host2"), ==, "checksum2");
+  g_assert_cmpstr (cockpit_web_service_get_checksum (service, "localhost"), ==, "checksum1");
+  g_assert_cmpstr (cockpit_web_service_get_checksum (service, "bad"), ==, NULL);
+
+  cockpit_web_service_set_host_checksum(service, "host2", "checksum3");
+  g_assert_cmpstr (cockpit_web_service_get_checksum (service, "host2"), ==, "checksum3");
+  g_assert_cmpstr (cockpit_web_service_get_host (service, "checksum3"), ==, "host2");
+  g_assert_cmpstr (cockpit_web_service_get_host (service, "checksum2"), ==, NULL);
+
+  g_object_unref (service);
+  g_object_unref (transport);
+  cockpit_creds_unref (creds);
 }
 
 typedef struct {
@@ -1370,7 +1418,7 @@ test_parse_external_failure (gconstpointer data)
 
   cockpit_expect_message (fixture->message);
 
-  ret = cockpit_web_service_parse_external (object, NULL, NULL, NULL);
+  ret = cockpit_web_service_parse_external (object, NULL, NULL, NULL, NULL);
   g_assert (ret == FALSE);
 
   json_object_unref (object);
@@ -1474,6 +1522,7 @@ main (int argc,
               setup_for_socket, test_authorize_password, teardown_for_socket);
 
   g_test_add_func ("/web-service/parse-external/success", test_parse_external);
+  g_test_add_func ("/web-service/host-checksums", test_host_checksums);
   for (i = 0; i < G_N_ELEMENTS (external_failure_fixtures); i++)
     {
       name = g_strdup_printf ("/web-service/parse-external/%s", external_failure_fixtures[i].name);

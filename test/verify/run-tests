@@ -11,7 +11,7 @@ import unittest
 
 import parent
 import testlib
-import testinfra
+import testvm
 
 sys.dont_write_bytecode = True
 
@@ -27,21 +27,6 @@ def check_valid(filename):
     if not all(c in allowed for c in name):
         return None
     return name.replace("-", "_")
-
-def install(opts):
-    try:
-        sys.stderr.write("Building and installing Cockpit ...\n")
-        cmd = [ os.path.join(testinfra.TEST_DIR, "verify", "testsuite-prepare") ]
-        if opts.clean:
-            cmd.append("--clean")
-        if opts.quick:
-            cmd.append("--quick")
-        subprocess.check_call(cmd)
-        return 0
-    except:
-        traceback.print_exc()
-        sys.stderr.write("Install failed\n")
-        return 1
 
 def run(opts):
     # Now actually load the tests, any modules that start with "check-*"
@@ -61,22 +46,11 @@ def run(opts):
 def main():
     parser = testlib.arg_parser()
     parser.add_argument('--publish', action='store', help="Unused")
-    parser.add_argument('--install', dest='install', action='store_true',
-                        help='Build and install Cockpit into test VMs')
-    parser.add_argument('--quick', dest='quick', action='store_true',
-                        help="Build test VMs quicker")
-    parser.add_argument('--clean', dest='clean', action='store_true',
-                        help="Build test VMs from clean state")
     parser.add_argument('image', action='store', nargs='?',
                         help='The operating system image to verify against')
     opts = parser.parse_args()
 
-    image = opts.image or testinfra.DEFAULT_IMAGE
-
-    # os.chdir(os.path.dirname(__file__))
-
-    # In case we need it
-    github = testinfra.GitHub()
+    image = opts.image or testvm.DEFAULT_IMAGE
 
     revision = os.environ.get("TEST_REVISION")
     if not revision:
@@ -84,16 +58,10 @@ def main():
 
     # Tell any subprocesses what we are testing
     os.environ["TEST_REVISION"] = revision
-    testinfra.DEFAULT_IMAGE = image
+    testvm.DEFAULT_IMAGE = image
     os.environ["TEST_OS"] = image
 
-    ret = 0
-    if opts.install:
-        ret = install(opts)
-    if not ret:
-        ret = run(opts)
-
-    return ret
+    return run(opts)
 
 if __name__ == '__main__':
     sys.exit(main())

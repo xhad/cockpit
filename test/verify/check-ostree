@@ -19,9 +19,9 @@
 # along with Cockpit; If not, see <http://www.gnu.org/licenses/>.
 
 import parent
-import testinfra
 from testlib import *
 import os
+import subprocess
 
 INSTALL_RPMS = [
     "empty-1-0.noarch",
@@ -42,22 +42,37 @@ def get_os_name(m):
     else:
         return "fedora-atomic"
 
-def start_trivial_httpd(m, remote="local", location=REPO_LOCATION):
-    remote = m.execute(["ostree", "remote", "show-url", remote])
-    parts = remote.strip().split(":")
-    port = parts[-1]
+def ensure_remote_http_port (m, remote="local"):
+    remote_spec = m.execute(["ostree", "remote", "show-url", remote])
+    if remote_spec.startswith("http"):
+        parts = remote_spec.strip().split(":")
+        port = parts[-1]
+    else:
+        m.execute(["ostree", "remote", "delete", remote])
+        m.execute(["ostree", "remote", "add", remote,
+                   "http://127.0.0.1:12345", "--no-gpg-verify"])
+        try:
+            m.execute(["rpm-ostree reload"])
+        except subprocess.CalledProcessError:
+            m.execute("systemctl restart rpm-ostreed")
+        port = 12345
 
-    script = "cd {0}\nsetsid python -m SimpleHTTPServer {1} >/dev/null 2>&1 < /dev/null &\necho $!".format(location, port)
-    result = m.execute(script=script,
-                       environment={"PYTHONUNBUFFERED" : "1"})
+    return port
+
+def start_trivial_httpd(m, remote="local", location=REPO_LOCATION):
+    port = ensure_remote_http_port (m, remote)
+    script = "export PYTHONUNBUFFERED=1\ncd {0}\nexec python -m SimpleHTTPServer {1}".format(location, port)
+    m.execute("echo '{}' > /tmp/trivial-httpd".format(script))
+    m.execute("chmod +x /tmp/trivial-httpd")
+    pid = m.spawn("/tmp/trivial-httpd", "trivial-httpd")
 
     m.execute(["ostree", "summary", "--repo={}".format(location), "-u"])
     m.wait_for_cockpit_running(port=port)
-    return result.strip()
+    return pid
 
 def stop_trivial_httpd(m, pid):
     if pid:
-        m.execute(["kill", pid])
+        m.execute(["kill", str(pid)])
 
 def generate_new_commit(m, pkg_to_remove):
     # Make one change of each type to a new rpm tree
@@ -98,12 +113,11 @@ def rhsmcertd_hack(m):
     m.execute("systemctl stop rhsmcertd || true")
 
 
-@skipImage("No OSTree available", "centos-7", "debian-8", "debian-testing", "fedora-24", "fedora-25", "fedora-testing", "rhel-7", "ubuntu-1604")
+@skipImage("No OSTree available", "centos-7", "debian-stable", "debian-testing", "fedora-24", "fedora-25", "fedora-26", "fedora-testing", "fedora-i386", "rhel-7", "rhel-7-4", "ubuntu-1604", "ubuntu-stable")
 class OstreeRestartCase(MachineCase):
-
-    def setUp(self):
-        # we need a static ip for this test becuase we restart
-        MachineCase.setUp(self, macaddr='52:54:00:9e:00:F5')
+    provision = {
+        "machine1": { "address": "10.111.113.2/20", "dns": "10.111.113.2" }
+    }
 
     def switch_to_packages(self, b, sel, required_classes):
         b.wait_not_visible("{0} div.packages".format(sel))
@@ -133,6 +147,9 @@ class OstreeRestartCase(MachineCase):
     def testOstree(self):
         b = self.browser
         m = self.machine
+
+        # Delete local remote so we start clean, without a file based remote
+        ensure_remote_http_port (m)
 
         docker_pkg = m.execute("rpm -qa | grep cockpit-docker").strip()
 
@@ -260,7 +277,6 @@ class OstreeRestartCase(MachineCase):
         m.start_cockpit()
         b.reload()
         b.login_and_go("/updates")
-        m.reset_reboot_flag()
 
         # After reboot, check commit
         b.wait_present('table.listing-ct')
@@ -309,7 +325,6 @@ class OstreeRestartCase(MachineCase):
         m.start_cockpit()
         b.reload()
         b.login_and_go("/updates")
-        m.reset_reboot_flag()
 
         # After reboot upgrade but no rollback target
         b.wait_present('table.listing-ct')
@@ -388,7 +403,6 @@ class OstreeRestartCase(MachineCase):
         m.start_cockpit()
         b.reload()
         b.login_and_go("/updates")
-        m.reset_reboot_flag()
 
         # After reboot, check commit
         b.wait_present('table.listing-ct')
@@ -400,8 +414,11 @@ class OstreeRestartCase(MachineCase):
 
         self.allow_restart_journal_messages()
 
-@skipImage("No OSTree available", "centos-7", "debian-8", "debian-testing", "fedora-24", "fedora-25", "fedora-testing", "rhel-7", "ubuntu-1604")
+@skipImage("No OSTree available", "centos-7", "debian-stable", "debian-testing", "fedora-24", "fedora-25", "fedora-26", "fedora-testing", "fedora-i386", "rhel-7", "rhel-7-4", "ubuntu-1604", "ubuntu-stable")
 class OstreeCase(MachineCase):
+    provision = {
+        "machine1": { "address": "10.111.113.2/20", "dns": "10.111.113.2" }
+    }
 
     def testRemoteManagement(self):
         m = self.machine
@@ -418,8 +435,6 @@ class OstreeCase(MachineCase):
 
         b.wait_present('table.listing-ct tbody:nth-child(2) i.fa-caret-up')
         b.wait_not_present('table.listing-ct tbody:nth-child(2) div.alert-warning')
-        b.wait_present('#change-repo')
-        b.wait_text("#change-repo", "local")
         b.wait_present("#change-branch")
         b.wait_in_text("#change-branch", branch)
         b.wait_present("table.listing-ct tbody:nth-child(2) ul.dropdown-menu")
@@ -427,6 +442,8 @@ class OstreeCase(MachineCase):
         b.wait_not_present("table.listing-ct tbody:nth-child(2) ul.dropdown-menu li div.alert")
         b.call_js_func("ph_count_check", "table.listing-ct tbody:nth-child(2) ul.dropdown-menu li",  1)
         b.wait_in_text("table.listing-ct tbody:nth-child(2) ul.dropdown-menu li", branch)
+        b.wait_present('#change-repo')
+        b.wait_text("#change-repo", "local")
         b.click("#change-repo")
 
         b.wait_present("modal-dialog")
@@ -513,6 +530,7 @@ class OstreeCase(MachineCase):
         m.execute(["ostree", "summary", "--repo={}".format(REPO_LOCATION), "-u"])
 
         # Edit
+        b.wait_present('#change-repo')
         b.click("#change-repo")
         b.wait_present("modal-dialog")
         b.wait_present("modal-dialog .modal-body .list-group")
@@ -535,8 +553,7 @@ class OstreeCase(MachineCase):
         b.click("modal-dialog .group-buttons button.btn-primary")
         b.wait_present("modal-dialog .group-buttons div.dialog-error")
 
-        with open(os.path.join(testinfra.TEST_DIR, "verify",
-                               "files", "publickey.asc"), 'rb') as fp:
+        with open(os.path.join(TEST_DIR, "verify", "files", "publickey.asc"), 'rb') as fp:
             gpg_data = fp.read()
 
         b.set_val("modal-dialog #gpg-data", gpg_data)
@@ -623,8 +640,6 @@ class OstreeCase(MachineCase):
         b.reload()
         b.enter_page("/updates")
         b.wait_present('table.listing-ct tbody:nth-child(2) i.fa-caret-up')
-        b.wait_present('#change-repo')
-        b.wait_text("#change-repo", "local")
         b.wait_present("#change-branch")
         b.wait_in_text("#change-branch", branch)
         b.wait_in_text("table.listing-ct tbody:nth-child(2) div.listing-ct-actions button", "Check for Updates")
@@ -634,6 +649,8 @@ class OstreeCase(MachineCase):
         b.wait_present('table.listing-ct tbody:nth-child(3) i.fa-circle')
 
         # Switching to branch shows pulled
+        b.wait_present('#change-repo')
+        b.wait_text("#change-repo", "local")
         b.click("#change-repo")
         b.wait_present("modal-dialog")
         b.wait_present("modal-dialog .modal-body .list-group")

@@ -26,7 +26,6 @@ And lastly get Webpack and the development dependencies:
 
     $ sudo npm install -g webpack
     $ npm install
-    $ ./node_modules/bower/bin/bower install
 
 When relying on CI to run the test suite, this is all that is
 necessary to work on the JavaScript components of Cockpit.
@@ -37,14 +36,15 @@ additional header files and other components. Check
 `tools/cockpit.spec` for the concrete Fedora build dependencies.
 The following should work in a fresh Git clone:
 
+    $ sudo yum install yum-utils
     $ sudo yum-builddep tools/cockpit.spec
 
 In addition, for testing, the following dependencies are required:
 
     $ sudo yum install curl expect \
         libvirt libvirt-client libvirt-daemon libvirt-python \
-        python python-libguestfs python-lxml qemu qemu-kvm \
-        rpm-build rsync xz
+        python python-libguestfs python-lxml libguestfs-xfs \
+        libguestfs-tools qemu qemu-kvm rpm-build rsync xz
 
 ## Running the integration test suite
 
@@ -119,9 +119,10 @@ git checkout directory, run the following, and log into Cockpit again:
 ## Contributing a change
 
 Make a pull request on github.com with your change. All changes get
-reviewed, tested and iterated on before getting into Cockpit. Don't feel
-bad if there's multiple steps back and forth asking for changes or tweaks
-before your change gets in.
+reviewed, tested and iterated on before getting into Cockpit. The general
+workflow is described in the [wiki](https://github.com/cockpit-project/cockpit/wiki/Workflow).
+Don't feel bad if there's multiple steps back and forth asking for changes
+or tweaks before your change gets in.
 
 You need to be familiar with git to contribute a change. Do your changes
 on a branch. Your change should be one or more git commits that each
@@ -275,3 +276,25 @@ And you can run cockpit-ws and cockpit-bridge under valgrind like this:
 
 Note that cockpit-session and cockpit-bridge will run from the installed
 prefix, rather than your build tree.
+
+# Running Internet Explorer to test Cockpit
+
+While running Firefox or Chrome on your Linux or Mac development machine
+may be easy, some people find it harder to test Internet Explorer. To
+use the following method you need access to the ```windows-8``` testing
+image. This image cannot be freely distributed for licensing reasons.
+
+Make sure you have the ```virt-viewer``` package installed on your Linux
+machine. And then run the following from the Cockpit checkout directory:
+
+    $ test/vm-run --network windows-8
+
+If the image is not yet downloaded, it'll take a while to download and
+you'll see progress on the command line. A screen will pop up and
+Windows will boot. Various command lines will show up once Windows has
+started. Ignore or minimize them, before starting Internet Explorer.
+
+Type the following into Internet Explorer's address bar to access Cockpit
+running on your development machine:
+
+     https://10.111.112.1:9090

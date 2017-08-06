@@ -576,43 +576,6 @@
     </div>
   </script>
 
-  <script id="mdraid-members-tmpl" type="x-template/mustache">
-    <div class="panel panel-default" id="disks">
-      <div class="panel-heading">
-        <span translatable="yes">Disks</span>
-        {{#DynamicMembers}}
-        <button class="btn btn-default btn-control-ct storage-privileged pull-right fa fa-plus"
-                data-action="mdraid_add_disk" data-arg="{{MDRaid.dbus.path}}">
-        </button>
-        {{/DynamicMembers}}
-      </div>
-      <table class="table">
-        {{#Members}}
-        <tr>
-          <td class="storage-icon">
-            <div><img  src="images/storage-disk.png"></div>
-          </td>
-          <td>
-            <span>{{#Slot}}{{.}}{{/Slot}}{{^Slot}}-{{/Slot}} {{#LinkTarget}}{{{html}}}{{/LinkTarget}}</span>
-            {{#States}}
-            <br>
-            <span {{#Danger}}class="state-danger"{{/Danger}}>{{Description}}</span>
-            {{/States}}
-          </td>
-          {{#DynamicMembers}}
-          <td class="storage-action">
-            <button class="btn btn-default btn-control-ct fa fa-minus tooltip-ct"
-                    {{#Excuse}}disabled title="{{.}}"{{/Excuse}}
-                    data-action="mdraid_remove_disk" data-arg="{{path}}">
-            </button>
-          </td>
-          {{/DynamicMembers}}
-        </tr>
-        {{/Members}}
-      </table>
-    </div>
-  </script>
-
   <script id="vgroup-detail-tmpl" type="x-template/mustache">
     <div class="panel panel-default">
       <div class="panel-heading">
@@ -631,37 +594,6 @@
         </tr>
       </table>
       {{/VGroup}}
-    </div>
-  </script>
-
-  <script id="vgroup-pvs-tmpl" type="x-template/mustache">
-    <div class="panel panel-default" id="pvols">
-      <div class="panel-heading">
-        <span translatable="yes">Physical Volumes</span>
-        <button class="btn btn-default storage-privileged pull-right btn-control-ct fa fa-plus"
-                data-action="vgroup_add_disk" data-arg="{{VGroup.dbus.path}}">
-        </button>
-      </div>
-      <table class="table">
-        {{#PVols}}
-        <tr>
-          <td class="storage-icon">
-            <div><img  src="images/storage-disk.png"></div>
-          </td>
-          <td>
-            <span>{{#LinkTarget}}{{{html}}}{{/LinkTarget}}</span>
-            <br>
-            <span>{{Sizes}}</span>
-          </td>
-          <td class="storage-action">
-            <button class="btn btn-default btn-control-ct fa fa-minus tooltip-ct"
-                    {{#Excuse}}disabled title="{{.}}"{{/Excuse}}
-                    data-action="{{action}}" data-args="{{args}}">
-            </button>
-          </td>
-        </tr>
-        {{/PVols}}
-      </table>
     </div>
   </script>
 
@@ -722,6 +654,24 @@
               <span class="alert-message">{{Message}}</span>
             </div>
             {{/Alerts}}
+            {{#Blocking}}
+            {{#HasPhysicalVolumes}}
+            <p translate>This device is currently used for volume groups.</p>
+            <table class="table table-bordered">
+              {{#PhysicalVolumes}}
+              <tr><td><span class="pull-right">{{Name}}</span>{{VGroup}}</td></tr>
+              {{/PhysicalVolumes}}
+            </table>
+            {{/HasPhysicalVolumes}}
+            {{#HasMDRaidMembers}}
+            <p translate>This device is currently used for RAID devices.</p>
+            <table class="table table-bordered">
+              {{#MDRaidMembers}}
+              <tr><td><span class="pull-right">{{Name}}</span>{{MDRaid}}</td></tr>
+              {{/MDRaidMembers}}
+            </table>
+            {{/HasMDRaidMembers}}
+            {{/Blocking}}
             <table class="form-table-ct">
               {{#Fields}}
               <tr>
@@ -813,7 +763,12 @@
                     {{#Options}}
                     <li class="list-group-item">
                       <div class="checkbox">
-                        <label><input type="checkbox"><span>{{Title}}</span></label>
+                        <label><input type="checkbox">
+                          {{#Label}}
+                          <span class="pull-right">{{.}}</span>
+                          {{/Label}}
+                          <span>{{Title}}</span>
+                        </label>
                       </div>
                     </li>
                     {{/Options}}
@@ -855,12 +810,46 @@
             </table>
           </div>
           <div class="modal-footer">
+            {{#Teardown}}
+            <div class="modal-footer-teardown">
+              {{#HasMounts}}
+              <p translate>This device has filesystems that are currently in use.<br>
+                Proceeding will unmount all filesystems on it.</p>
+              <table class="table table-bordered">
+                {{#Mounts}}
+                <tr><td><span class="pull-right">{{Name}}</span>{{MountPoint}}</td></tr>
+                {{/Mounts}}
+              </table>
+              {{/HasMounts}}
+              {{#HasPhysicalVolumes}}
+              <p translate>This device is currently used for volume groups.<br>
+                Proceeding will remove it from its volume groups.</p>
+              <table class="table table-bordered">
+                {{#PhysicalVolumes}}
+                <tr><td><span class="pull-right">{{Name}}</span>{{VGroup}}</td></tr>
+                {{/PhysicalVolumes}}
+              </table>
+              {{/HasPhysicalVolumes}}
+              {{#HasMDRaidMembers}}
+              <p translate>This device is currently used for RAID devices.<br>
+                Proceeding will remove it from its RAID devices.</p>
+              <table class="table table-bordered">
+                {{#MDRaidMembers}}
+                <tr><td><span class="pull-right">{{Name}}</span>{{MDRaid}}</td></tr>
+                {{/MDRaidMembers}}
+              </table>
+              {{/HasMDRaidMembers}}
+            </div>
+            {{/Teardown}}
             {{#Action}}
             {{#Danger}}<div class="modal-footer-danger">{{.}}</div>{{/Danger}}
             <div class="spinner spinner-sm pull-left" hidden></div>
             <button class="btn btn-default" translatable="yes" data-dismiss="modal">Cancel</button>
             <button class="btn {{#Danger}}btn-danger{{/Danger}}{{^Danger}}btn-primary{{/Danger}}"
                     data-action="apply">{{Title}}</button>
+            {{/Action}}
+            {{^Action}}
+            <button class="btn btn-default" translatable="yes" data-dismiss="modal">Close</button>
             {{/Action}}
           </div>
         </div>

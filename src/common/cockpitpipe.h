@@ -75,7 +75,9 @@ CockpitPipe *      cockpit_pipe_spawn        (const gchar **argv,
 
 CockpitPipe *      cockpit_pipe_pty          (const gchar **argv,
                                               const gchar **env,
-                                              const gchar *directory);
+                                              const gchar *directory,
+                                              guint16 window_rows,
+                                              guint16 window_cols);
 
 CockpitPipe *      cockpit_pipe_connect      (const gchar *name,
                                               GSocketAddress *address);
@@ -109,9 +111,6 @@ GBytes *           cockpit_pipe_consume      (GByteArray *buffer,
                                               gsize before,
                                               gsize length,
                                               gsize after);
-
-gssize             cockpit_pipe_parse_length (GByteArray *input,
-                                              gsize *consumed);
 
 gchar **           cockpit_pipe_get_environ  (const gchar **set,
                                               const gchar *directory);

@@ -23,7 +23,7 @@ from testlib import *
 from storagelib import *
 
 @skipImage("storaged-iscsi not packaged", "centos-7", "debian-testing")
-@skipImage("UDisks doesn't have support for iSCSI", "debian-8", "ubuntu-1604")
+@skipImage("UDisks doesn't have support for iSCSI", "debian-stable", "ubuntu-1604", "ubuntu-stable")
 class TestStorage(StorageCase):
     def testISCSI(self):
         m = self.machine
@@ -31,7 +31,7 @@ class TestStorage(StorageCase):
         b.wait_timeout(120)
 
         # rhel-7 is missing the iSCSI session API
-        if m.image == "rhel-7":
+        if m.image in ["rhel-7", "rhel-7-4"]:
             self.login_and_go("/storage")
             # The optional parts of the UI have been configured
             # properly before the page is shown, so we can now
@@ -48,7 +48,13 @@ class TestStorage(StorageCase):
 
         # Setup a iSCSI target with authentication for discovery and join
         #
+        # HACK - some versions of targetcli crash when TERM is not set
+        #        and stdout is not a tty.
+        #
+        #        https://bugzilla.redhat.com/show_bug.cgi?id=1441121
+
         m.execute("""
+                  export TERM=dumb
                   targetcli /backstores/ramdisk create test 50M
                   targetcli /iscsi set discovery_auth enable=1 userid=admin password=foobar
                   targetcli /iscsi create %(tgt)s
@@ -110,11 +116,39 @@ class TestStorage(StorageCase):
         b.click('#storage-detail .breadcrumb a')
         b.wait_visible('#storage')
 
-        b.click('#iscsi-sessions .arm-button')
-        b.wait_visible('#iscsi-sessions button[data-iscsi-session-remove]')
-        b.click('#iscsi-sessions button[data-iscsi-session-remove]')
+        # Add the target a second time, just to check that the sorting function works
+        b.click('[data-action="add-iscsi-portal"]')
+        self.dialog_wait_open()
+        self.dialog_set_val("address", "172.27.0.15")
+        self.dialog_set_val("username", "admin")
+        self.dialog_set_val("password", "foobar")
+        self.dialog_apply()
+        # The dialog closes and a new dialog opens but we can't get
+        # inbetween that, so we just wait for the new fields to
+        # appear.
+        b.wait_present(self.dialog_field("target"))
+        b.wait_in_text(self.dialog_field("target"), target_iqn)
+        self.dialog_apply()
+        # Login will fail and a new dialog opens
+        b.wait_present(self.dialog_field("username"))
+        self.dialog_wait_val("username", "admin")
+        self.dialog_wait_val("password", "foobar")
+        self.dialog_set_val("password", "barfoo")
+        self.dialog_apply()
+        self.dialog_wait_close()
 
-        b.wait_not_in_text('#iscsi-sessions', target_iqn)
+        b.wait_in_text('#iscsi-sessions', "172.27.0.15")
+
+        b.click('#iscsi-sessions .arm-button')
+        b.wait_visible('#iscsi-sessions tr:contains(127.0.0.1) button[data-iscsi-session-remove]')
+        b.click('#iscsi-sessions tr:contains(127.0.0.1) button[data-iscsi-session-remove]')
+        b.wait_not_present('#iscsi-sessions tr:contains(127.0.0.1)')
+
+        b.click('#iscsi-sessions .arm-button')
+        b.wait_visible('#iscsi-sessions tr:contains(172.27.0.15) button[data-iscsi-session-remove]')
+        b.click('#iscsi-sessions tr:contains(172.27.0.15) button[data-iscsi-session-remove]')
+        b.wait_not_present('#iscsi-sessions tr:contains(172.27.0.15)')
+
         b.wait_not_in_text('#drives', "LIO-ORG test")
 
 if __name__ == '__main__':

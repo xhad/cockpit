@@ -33,6 +33,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 /*
  * To recalculate the checksums found in this file, do something like:
@@ -56,7 +57,9 @@ typedef struct {
   const gchar *path;
   const gchar *accept[8];
   const gchar *expect;
+  const gchar *headers[8];
   gboolean cacheable;
+  gboolean no_packages_init;
 } Fixture;
 
 static void
@@ -88,6 +91,7 @@ setup (TestCase *tc,
   const gchar *control;
   gchar *accept;
   GBytes *bytes;
+  guint i;
 
   g_assert (fixture != NULL);
 
@@ -124,6 +128,11 @@ setup (TestCase *tc,
     }
   if (!fixture->cacheable)
     json_object_set_string_member (headers, "Pragma", "no-cache");
+  for (i = 0; i < G_N_ELEMENTS (fixture->headers); i += 2)
+    {
+      if (fixture->headers[i])
+        json_object_set_string_member (headers, fixture->headers[i], fixture->headers[i + 1]);
+    }
   json_object_set_object_member (options, "headers", headers);
 
   tc->channel = g_object_new (COCKPIT_TYPE_HTTP_STREAM,
@@ -182,6 +191,30 @@ test_simple (TestCase *tc,
   data = mock_transport_combine_output (tc->transport, "444", &count);
   cockpit_assert_bytes_eq (data, "{\"status\":200,\"reason\":\"OK\",\"headers\":{\"Cache-Control\":\"no-cache, no-store\"}}"
                            "These are the contents of file.ext\nOh marmalaaade\n", -1);
+  g_assert_cmpuint (count, ==, 2);
+  g_bytes_unref (data);
+}
+
+static const Fixture fixture_forwarded = {
+  .path = "/another/test.html",
+  .headers = { "X-Forwarded-Proto", "https", "X-Forwarded-Host", "blah:9090" },
+};
+
+static void
+test_forwarded (TestCase *tc,
+             gconstpointer fixture)
+{
+  GBytes *data;
+  guint count;
+
+  g_assert (fixture == &fixture_forwarded);
+
+  while (tc->closed == FALSE)
+    g_main_context_iteration (NULL, TRUE);
+  g_assert_cmpstr (tc->problem, ==, NULL);
+
+  data = mock_transport_combine_output (tc->transport, "444", &count);
+  cockpit_assert_bytes_eq (data, "{\"status\":200,\"reason\":\"OK\",\"headers\":{\"Content-Security-Policy\":\"default-src 'self' https://blah:9090; connect-src 'self' https://blah:9090 ws: wss:\",\"Content-Type\":\"text/html\",\"Cache-Control\":\"no-cache, no-store\",\"Access-Control-Allow-Origin\":\"https://blah:9090\"}}<html>\x0A<head>\x0A<title>In home dir</title>\x0A</head>\x0A<body>In home dir</body>\x0A</html>\x0A", -1);
   g_assert_cmpuint (count, ==, 2);
   g_bytes_unref (data);
 }
@@ -585,7 +618,7 @@ test_list_bad_name (TestCase *tc,
   data = mock_transport_combine_output (tc->transport, "444", &count);
   cockpit_assert_bytes_eq (data, "{\"status\":200,\"reason\":\"OK\",\"headers\":"
                                      "{\"X-Cockpit-Pkg-Checksum\":\"524d07b284cda92c86a908c67014ee882a80193b\",\"Content-Type\":\"application/json\",\"ETag\":\"\\\"$524d07b284cda92c86a908c67014ee882a80193b\\\"\"}}"
-                                 "{\"ok\":{}}", -1);
+                                 "{\".checksum\":\"524d07b284cda92c86a908c67014ee882a80193b\",\"ok\":{\".checksum\":\"524d07b284cda92c86a908c67014ee882a80193b\"}}", -1);
   g_assert_cmpuint (count, ==, 2);
   g_bytes_unref (data);
 }
@@ -636,7 +669,8 @@ setup_basic (TestCase *tc,
       cockpit_expect_message ("requires: package has an unknown requirement: unknown");
     }
 
-  tc->packages = cockpit_packages_new ();
+  if (!fixture || !fixture->no_packages_init)
+    tc->packages = cockpit_packages_new ();
 }
 
 static void
@@ -806,6 +840,164 @@ test_get_bridges_broken (TestCase *tc,
   g_assert (bridges == NULL);
 }
 
+static const Fixture fixture_reload = {
+  .no_packages_init = TRUE,
+  .datadirs = { BUILDDIR "/src/bridge/mock-resource/reload", NULL },
+};
+
+__attribute__((format(printf, 1, 2)))
+static void
+systemf (const gchar *fmt, ...)
+{
+  gchar *cmd;
+
+  va_list ap;
+  va_start (ap, fmt);
+  cmd = g_strdup_vprintf (fmt, ap);
+  va_end (ap);
+
+  g_assert (system (cmd) == 0);
+
+  g_free (cmd);
+}
+
+static void
+setup_reload_packages (const gchar *datadir,
+                       const gchar *variant)
+{
+  const gchar *srcdir = SRCDIR "/src/bridge/mock-resource/reload";
+  systemf ("mkdir -p $(dirname '%s') && rm -rf '%s' && ln -sf '%s.%s' '%s'",
+           datadir, datadir, srcdir, variant, datadir);
+}
+
+static void
+teardown_reload_packages (const gchar *datadir)
+{
+  systemf ("rm -f '%s'", datadir);
+}
+
+static void
+assert_manifest_checksum (TestCase *tc,
+                          const gchar *name,
+                          const gchar *expected)
+{
+  JsonObject *json;
+  const gchar *checksum;
+
+  json = cockpit_packages_peek_json (tc->packages);
+  if (name)
+    g_assert (cockpit_json_get_object (json, name, NULL, &json));
+  if (expected)
+    {
+      g_assert (cockpit_json_get_string (json, ".checksum", NULL, &checksum));
+      g_assert_cmpstr (checksum, ==, expected);
+    }
+  else
+    g_assert (json == NULL);
+}
+
+static void
+test_reload_added (TestCase *tc,
+                   gconstpointer data)
+{
+  const Fixture *fixture = data;
+  const gchar *datadir;
+
+  cockpit_bridge_data_dirs = (const gchar **)fixture->datadirs;
+  datadir = cockpit_bridge_data_dirs[0];
+
+  setup_reload_packages (datadir, "old");
+  tc->packages = cockpit_packages_new ();
+
+  assert_manifest_checksum (tc, NULL,  "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+  assert_manifest_checksum (tc, "old", "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+
+  setup_reload_packages (datadir, "new");
+  cockpit_packages_reload (tc->packages);
+
+  assert_manifest_checksum (tc, NULL,  "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+  assert_manifest_checksum (tc, "old", "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+  assert_manifest_checksum (tc, "new", "516e9877b1255fa22f18c869e1715f39dd4b39ec");
+
+  teardown_reload_packages (datadir);
+}
+
+static void
+test_reload_removed (TestCase *tc,
+                     gconstpointer data)
+{
+  const Fixture *fixture = data;
+  const gchar *datadir;
+
+  cockpit_bridge_data_dirs = (const gchar **)fixture->datadirs;
+  datadir = cockpit_bridge_data_dirs[0];
+
+  setup_reload_packages (datadir, "new");
+  tc->packages = cockpit_packages_new ();
+
+  assert_manifest_checksum (tc, NULL,  "516e9877b1255fa22f18c869e1715f39dd4b39ec");
+  assert_manifest_checksum (tc, "old", "516e9877b1255fa22f18c869e1715f39dd4b39ec");
+  assert_manifest_checksum (tc, "new", "516e9877b1255fa22f18c869e1715f39dd4b39ec");
+
+  setup_reload_packages (datadir, "old");
+  cockpit_packages_reload (tc->packages);
+
+  assert_manifest_checksum (tc, NULL,  "516e9877b1255fa22f18c869e1715f39dd4b39ec");
+  assert_manifest_checksum (tc, "old", "516e9877b1255fa22f18c869e1715f39dd4b39ec");
+  assert_manifest_checksum (tc, "new", NULL);
+
+  teardown_reload_packages (datadir);
+}
+
+static void
+test_reload_updated (TestCase *tc,
+                     gconstpointer data)
+{
+  const Fixture *fixture = data;
+  const gchar *datadir;
+
+  cockpit_bridge_data_dirs = (const gchar **)fixture->datadirs;
+  datadir = cockpit_bridge_data_dirs[0];
+
+  setup_reload_packages (datadir, "old");
+  tc->packages = cockpit_packages_new ();
+
+  assert_manifest_checksum (tc, NULL,  "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+  assert_manifest_checksum (tc, "old", "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+
+  setup_reload_packages (datadir, "updated");
+  cockpit_packages_reload (tc->packages);
+
+  assert_manifest_checksum (tc, NULL,  "0e4445bda678eede7c520a0a0b87aae56e7570cf");
+  assert_manifest_checksum (tc, "old", "252178c3fba5843c8c3bb4ce7733b405741cedee");
+
+  teardown_reload_packages (datadir);
+}
+
+static const Fixture fixture_csp_strip = {
+  .path = "/strip/test.html",
+  .datadirs = { SRCDIR "/src/bridge/mock-resource/csp", NULL },
+};
+
+static void
+test_csp_strip (TestCase *tc,
+                gconstpointer fixture)
+{
+  GBytes *data;
+  guint count;
+
+  g_assert (fixture == &fixture_csp_strip);
+
+  while (tc->closed == FALSE)
+    g_main_context_iteration (NULL, TRUE);
+  g_assert_cmpstr (tc->problem, ==, NULL);
+
+  data = mock_transport_combine_output (tc->transport, "444", &count);
+  cockpit_assert_bytes_eq (data, "{\"status\":200,\"reason\":\"OK\",\"headers\":{\"X-Cockpit-Pkg-Checksum\":\"0c58347ff749c5918f7f311c109369c377dc2ba1\",\"Content-Type\":\"text/html\",\"Content-Security-Policy\":\"connect-src 'self' ws: wss:; img-src: 'self' data:; default-src 'self'\"}}<html>\x0A<head>\x0A<title>Test</title>\x0A</head>\x0A<body>Test</body>\x0A</html>\x0A", -1);
+  g_assert_cmpuint (count, ==, 2);
+  g_bytes_unref (data);
+}
+
 int
 main (int argc,
       char *argv[])
@@ -819,6 +1011,8 @@ main (int argc,
 
   g_test_add ("/packages/simple", TestCase, &fixture_simple,
               setup, test_simple, teardown);
+  g_test_add ("/packages/forwarded", TestCase, &fixture_forwarded,
+              setup, test_forwarded, teardown);
   g_test_add ("/packages/localized-translated", TestCase, &fixture_pig,
               setup, test_localized_translated, teardown);
   g_test_add ("/packages/localized-unknown", TestCase, &fixture_unknown,
@@ -874,6 +1068,16 @@ main (int argc,
               setup_basic, test_get_bridges, teardown_basic);
   g_test_add ("/packages/get-bridges/broken", TestCase, &fixture_bad_bridges,
               setup_basic, test_get_bridges_broken, teardown_basic);
+
+  g_test_add ("/packages/reload/added", TestCase, &fixture_reload,
+              setup_basic, test_reload_added, teardown_basic);
+  g_test_add ("/packages/reload/removed", TestCase, &fixture_reload,
+              setup_basic, test_reload_removed, teardown_basic);
+  g_test_add ("/packages/reload/updated", TestCase, &fixture_reload,
+              setup_basic, test_reload_updated, teardown_basic);
+
+  g_test_add ("/packages/csp/strip", TestCase, &fixture_csp_strip,
+              setup, test_csp_strip, teardown);
 
   return g_test_run ();
 }

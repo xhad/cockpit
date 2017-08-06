@@ -26,16 +26,14 @@
 
     require('./kube-client');
     require('./date');
-    require('./listing');
     require('./tags');
+    require('./policy');
 
     require('registry-image-widgets/dist/image-widgets.js');
 
     require('../views/images-page.html');
     require('../views/imagestream-page.html');
     require('../views/image-page.html');
-    require('../views/image-panel.html');
-    require('../views/image-listing.html');
     require('../views/imagestream-delete.html');
     require('../views/imagestream-modify.html');
     require('../views/imagestream-modify.html');
@@ -55,12 +53,18 @@
         }
     }
 
+    function identifier(imagestream, tag) {
+        var id = imagestream.metadata.namespace + "/" + imagestream.metadata.name;
+        if (tag)
+            id += ":" + tag.name;
+        return id;
+    }
+
     angular.module('registry.images', [
         'ngRoute',
         'ui.cockpit',
         'kubeClient',
         'kubernetes.date',
-        'kubernetes.listing',
         'registry.tags',
         'registryUI.images',
     ])
@@ -86,32 +90,91 @@
         }
     ])
 
+    .factory('registryListingScopeSetup', [
+        'imageData',
+        'imageActions',
+        'projectData',
+        'kubeSelect',
+        '$location',
+        function (data, actions, projectData, select, $location) {
+            return function($scope, inPage) {
+                function imageByTag (tag) {
+                    if (tag && tag.items && tag.items.length)
+                        return select().kind("Image").name(tag.items[0].image).one();
+                }
+
+                function deleteImageStream(stream) {
+                    var promise = actions.deleteImageStream(stream);
+
+                    /* If the promise is successful, redirect to another page */
+                    promise.then(function() {
+                        $location.path($scope.viewUrl('images'));
+                    });
+
+                    return promise;
+                }
+
+                function deleteTag(stream, tag) {
+                    var promise = actions.deleteTag(stream, tag);
+
+                    /* If the promise is successful, redirect to another page */
+                    promise.then(function() {
+                        var parts = [ "images", stream.metadata.namespace, stream.metadata.name ];
+                        $location.path("/" + parts.map(encodeURIComponent).join("/"));
+                    });
+
+                    return promise;
+                }
+
+                /* All the actions available on the $scope */
+                angular.extend($scope, actions);
+                angular.extend($scope, data);
+
+                $scope.sharedImages = projectData.sharedImages;
+                $scope.imageTagNames = data.imageTagNames;
+                $scope.imageByTag = imageByTag;
+
+                if (inPage) {
+                    $scope.deleteTag = deleteTag;
+                    $scope.deleteImageStream = deleteImageStream;
+                }
+
+                $scope.actions = {
+                    modifyImageStream: $scope.modifyImageStream,
+                    deleteImageStream: $scope.deleteImageStream,
+                    deleteTag: $scope.deleteTag,
+                    modifyProject: $scope.modifyProject,
+                };
+            };
+        }
+    ])
+
     .controller('ImagesCtrl', [
         '$scope',
         '$location',
         'imageData',
         'imageActions',
-        'ListingState',
         'projectData',
+        'kubeLoader',
+        'registryListingScopeSetup',
         'filterService',
-        function($scope, $location, data, actions, ListingState, projectData) {
-            $scope.imagestreams = data.allStreams;
+        function($scope, $location, data, actions, projectData, loader, registryListingScopeSetup) {
             $scope.sharedImages = projectData.sharedImages;
 
-            angular.extend($scope, data);
-
-            $scope.listing = new ListingState($scope);
-
             /* Watch all the images in current namespace */
-            data.watchImages();
+            data.watchImages($scope);
 
-            $scope.$on("activate", function(ev, id) {
+            $scope.imagestreams = data.allStreams();
+            loader.listen(function() {
+                $scope.imagestreams = data.allStreams();
+            }, $scope);
+
+            $scope.$on("activate", function(ev, imagestream, tag) {
                 ev.preventDefault();
-                $location.path('/images/' + id);
+                $location.path('/images/' + identifier(imagestream, tag));
             });
 
-            /* All the actions available on the $scope */
-            angular.extend($scope, actions);
+            registryListingScopeSetup($scope, false);
         }
     ])
 
@@ -131,11 +194,13 @@
         '$routeParams',
         'kubeSelect',
         'kubeLoader',
+        'KubeDiscoverSettings',
         'imageData',
         'imageActions',
-        'ListingState',
         'projectData',
-        function($scope, $location, $routeParams, select, loader, data, actions, ListingState, projectData) {
+        'projectPolicy',
+        'registryListingScopeSetup',
+        function($scope, $location, $routeParams, select, loader, discoverSettings, data, actions, projectData, projectPolicy, registryListingScopeSetup) {
             var target = $routeParams["target"] || "";
             var pos = target.indexOf(":");
 
@@ -152,9 +217,10 @@
                 tagname = target.substr(pos + 1);
             }
 
+            registryListingScopeSetup($scope, true);
+
             /* There's no way to watch a single item ... so watch them all :( */
             data.watchImages($scope);
-
 
             loader.listen(function() {
                 $scope.stream = select().kind("ImageStream").namespace(namespace).name(name).one();
@@ -165,9 +231,8 @@
                         $scope.tag = tag;
                 });
 
-
                 if ($scope.tag)
-                    $scope.image = select().kind("Image").taggedFirst($scope.tag).one();
+                    $scope.image = $scope.imageByTag($scope.tag);
                 if ($scope.image) {
                     $scope.names = data.imageTagNames($scope.image);
                     $scope.config = data.imageConfig($scope.image);
@@ -176,93 +241,28 @@
                 }
             }, $scope);
 
-            $scope.listing = new ListingState($scope);
-            $scope.listing.inline = true;
-
-            /* So we can use the same imageListing directive */
-            $scope.imagestreams = function() {
-                if ($scope.stream)
-                    return { "/": $scope.stream };
-                return { };
-            };
-
-            /* All the data actions available on the $scope */
-            angular.extend($scope, data);
-            angular.extend($scope, actions);
-            $scope.sharedImages = projectData.sharedImages;
-
-            /* But special case a few */
-            $scope.deleteImageStream = function(stream) {
-                var promise = actions.deleteImageStream(stream);
-
-                /* If the promise is successful, redirect to another page */
-                promise.then(function() {
-                    $location.path($scope.viewUrl('images'));
-                });
-
-                return promise;
-            };
-
-            $scope.$on("activate", function(ev, id) {
+            $scope.$on("activate", function(ev, imagestream, tag) {
                 ev.preventDefault();
-                $location.path('/images/' + id);
+                $location.path('/images/' + identifier(imagestream, tag));
             });
 
-            $scope.deleteTag = function(stream, tag) {
-                var promise = actions.deleteTag(stream, tag);
-
-                /* If the promise is successful, redirect to another page */
-                promise.then(function() {
-                    var parts = [ "images", stream.metadata.namespace, stream.metadata.name ];
-                    $location.path("/" + parts.map(encodeURIComponent).join("/"));
+            function updateShowDockerPushCommands() {
+                discoverSettings().then(function(settings) {
+                    projectPolicy.subjectAccessReview(namespace, settings.currentUser, 'update', 'imagestreamimages')
+                       .then(function(allowed) {
+                            if (allowed != $scope.showDockerPushCommands) {
+                                $scope.showDockerPushCommands = allowed;
+                                $scope.$applyAsync();
+                            }
+                       });
                 });
+            }
 
-                return promise;
-            };
+            // watch for project changes to update showDockerPushCommands, and initialize it
+            $scope.$on("$routeUpdate", updateShowDockerPushCommands);
+            updateShowDockerPushCommands();
         }
     ])
-
-    .directive('imagePanel', [
-        'kubeLoader',
-        'imageData',
-        function(loader, data) {
-            return {
-                restrict: 'A',
-                scope: true,
-                link: function(scope, element, attrs) {
-                    var tab = 'main';
-                    scope.tab = function(name, ev) {
-                        if (ev) {
-                            tab = name;
-                            ev.stopPropagation();
-                        }
-                        return tab === name;
-                    };
-
-                    loader.listen(function() {
-                        scope.names = scope.config = scope.layers = scope.labels = null;
-                        if (scope.image) {
-                            scope.names = data.imageTagNames(scope.image);
-                            scope.config = data.imageConfig(scope.image);
-                            scope.layers = data.imageLayers(scope.image);
-                            scope.labels = data.imageLabels(scope.image);
-                        }
-                    }, scope);
-
-                },
-                templateUrl: "views/image-panel.html"
-            };
-        }
-    ])
-
-    .directive('imageListing',
-        function() {
-            return {
-                restrict: 'A',
-                templateUrl: 'views/image-listing.html'
-            };
-        }
-    )
 
     .factory("imageData", [
         'kubeSelect',
@@ -480,9 +480,6 @@
                 watchImages: watchImages,
                 allStreams: function allStreams() {
                     return select().kind("ImageStream");
-                },
-                imageByTag: function imageByTag(tag) {
-                    return select().kind("Image").taggedFirst(tag);
                 },
                 imageLayers: imageLayers,
                 imageConfig: function imageConfig(image) {

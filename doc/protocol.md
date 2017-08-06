@@ -148,10 +148,41 @@ prefix your groups with a reverse domain name so they don't conflict with
 other or Cockpit's group names. Group names without any punctuation are
 reserved.
 
-One such special group name is the "fence" group. While any channels are
-open in the "fence" group, any channels opened after that point will be
-blocked and wait until all channels in the "fence" group are closed before
-resuming.
+One such special group name is "default", which contains all channels which
+were opened without specifying a group.
+
+Another one is the "fence" group. While any channels are open in the "fence"
+group, any channels opened after that point will be blocked and wait until all
+channels in the "fence" group are closed before resuming.
+
+**Host values**
+
+Because the host parameter is how cockpit maps url requests to the correct bridge,
+cockpit may need to additional information to route the message correctly.
+For example you want to connect to a container ```my-container``` running
+on "my.host".
+
+To allow this the host parameter can encode a key/value pair that will
+be expanded in the open command json. The format is host+key+value. For example
+
+    {
+        "command": "open",
+        "channel": "a4",
+        "payload": "stream",
+        "host": "my.host+container+my-container"
+    }
+
+will be expanded to
+
+    {
+        "command": "open",
+        "channel": "a4",
+        "payload": "stream",
+        "host": "my.host",
+        "host-container": "my-container",
+        "host": "my.host"
+    }
+
 
 Command: close
 --------------
@@ -277,9 +308,6 @@ For challenge/response authentication, the following fields are defined:
  * "response": a response string present in messages from cockpit-ws
    to a bridge
 
-The contents of the "challenge" and "response" fields are defined and
-documented in the reauthorize component.
-
 Example authorize challenge and response messages:
 
     {
@@ -293,6 +321,19 @@ Example authorize challenge and response messages:
         "cookie": "555",
         "response": "crypt1:$6$r0oetn2039ntoen..."
     }
+
+Authorize messages are used during authentication by authentication
+commands (ei: cockpit-session, cockpit-ssh) to obtain the users credentials
+from cockpit-ws. An authentication command can send a authorize message
+with a response but no cookie. For example
+
+    {
+        "command": "authorize",
+        "response": "Basic ..."
+    }
+
+In that case cockpit-ws will store the response and use it in a reply
+to a subsequent challenge.
 
 For credential cache authorization, the following fields are defined:
 
@@ -744,13 +785,16 @@ following options can be specified:
    spawned process. The variables are in the form of "NAME=VALUE". The default
    environment is inherited from cockpit-bridge.
  * "pty": Execute the command as a terminal pty.
+ * "window": An object containing "rows" and "cols" properties, which set the
+   size of the terminal window. Values must be integers between 0 and 0xffff.
+   This option is only valid if "pty" is true.
 
 If an "done" is sent to the bridge on this channel, then the socket and/or pipe
 input is shutdown. The channel will send an "done" when the output of the socket
 or pipe is done.
 
 Additionally, a "options" control message may be sent in this channel
-to change the "batch" and "latency" options.
+to change the "batch", "latency", and "window" options.
 
 Payload: fswatch1
 -----------------

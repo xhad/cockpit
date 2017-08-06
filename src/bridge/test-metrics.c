@@ -541,6 +541,63 @@ test_dynamic_instances (TestCase *tc,
 }
 
 static void
+assert_not_root_mount (JsonArray *array,
+                       guint index_,
+                       JsonNode *element_node,
+                       gpointer user_data)
+{
+  g_assert_cmpstr (json_node_get_string (element_node), !=, "/");
+}
+
+static void
+test_omit_instances (void)
+{
+  MockTransport *transport = mock_transport_new ();
+  CockpitChannel *channel;
+  JsonObject *options = json_obj ("{ 'metrics': [ { 'name': 'mount.total' } ],"
+                                  "  'omit-instances': [ '/' ],"
+                                  "  'interval': 1000"
+                                  "}");
+  GBytes *msg;
+  JsonObject *res, *mount_total;
+  JsonArray *metrics;
+
+  g_signal_connect (transport, "closed", G_CALLBACK (on_transport_closed), NULL);
+
+  channel = g_object_new (cockpit_internal_metrics_get_type (),
+                          "transport", transport,
+                          "id", "1234",
+                          "options", options,
+                          NULL);
+
+  cockpit_channel_prepare (channel);
+
+  /* receive meta information */
+  while ((msg = mock_transport_pop_channel (transport, "1234")) == NULL)
+    g_main_context_iteration (NULL, TRUE);
+  res = cockpit_json_parse_bytes (msg, NULL);
+  g_assert (res != NULL);
+  g_assert (json_object_has_member (res, "metrics"));
+
+  /* metrics should have the form [{"name":"mount.total","instances":["/boot",...]}] */
+  metrics = json_object_get_array_member (res, "metrics");
+  g_assert_cmpint (json_array_get_length (metrics), ==, 1);
+  mount_total = json_array_get_object_element (metrics, 0);
+  g_assert (mount_total);
+  g_assert_cmpstr (json_object_get_string_member (mount_total, "name"), ==, "mount.total");
+
+  /* instances should not contain the omitted "/" */
+  json_array_foreach_element (json_object_get_array_member (mount_total, "instances"),
+                              assert_not_root_mount,
+                              NULL);
+
+  json_object_unref (res);
+  g_object_unref (channel);
+  json_object_unref (options);
+  g_object_unref (transport);
+}
+
+static void
 on_close_get_problem (CockpitChannel *channel,
                       const gchar *problem,
                       gpointer user_data)
@@ -591,6 +648,77 @@ test_not_supported (void)
   g_free (problem);
 }
 
+static void
+test_deprecated_net_all (void)
+{
+  MockTransport *transport = mock_transport_new ();
+  CockpitChannel *channel;
+  /* network.all.* is not being used any more in current cockpit, but in older
+   * Dashboards; ensure it keeps working */
+  JsonObject *options = json_obj ("{ 'metrics': [ { 'name': 'network.all.tx' }, { 'name': 'network.all.rx' } ],"
+                                  "  'interval': 100"
+                                  "}");
+  GBytes *msg;
+  JsonObject *res, *metric;
+  JsonNode *node;
+  JsonArray *metrics, *values;
+
+  g_signal_connect (transport, "closed", G_CALLBACK (on_transport_closed), NULL);
+
+  channel = g_object_new (cockpit_internal_metrics_get_type (),
+                          "transport", transport,
+                          "id", "1234",
+                          "options", options,
+                          NULL);
+
+  cockpit_metrics_set_compress (COCKPIT_METRICS (channel), FALSE);
+  cockpit_channel_prepare (channel);
+
+  /* receive meta information */
+  while ((msg = mock_transport_pop_channel (transport, "1234")) == NULL)
+    g_main_context_iteration (NULL, TRUE);
+  res = cockpit_json_parse_bytes (msg, NULL);
+  g_assert (res != NULL);
+  g_assert (json_object_has_member (res, "metrics"));
+
+  /* metrics should have the form [{"name":"network.all.tx","units":"bytes","semantics":"counter"}, ...] */
+  metrics = json_object_get_array_member (res, "metrics");
+  g_assert_cmpint (json_array_get_length (metrics), ==, 2);
+
+  metric = json_array_get_object_element (metrics, 0);
+  g_assert (metric);
+  g_assert_cmpstr (json_object_get_string_member (metric, "name"), ==, "network.all.tx");
+  g_assert_cmpstr (json_object_get_string_member (metric, "units"), ==, "bytes");
+  g_assert (!json_object_has_member (metric, "instances"));
+
+  metric = json_array_get_object_element (metrics, 1);
+  g_assert (metric);
+  g_assert_cmpstr (json_object_get_string_member (metric, "name"), ==, "network.all.rx");
+  g_assert_cmpstr (json_object_get_string_member (metric, "units"), ==, "bytes");
+  g_assert (!json_object_has_member (metric, "instances"));
+
+  json_object_unref (res);
+
+  /* receive data; should have the form [[123,456]] */
+  while ((msg = mock_transport_pop_channel (transport, "1234")) == NULL)
+    g_main_context_iteration (NULL, TRUE);
+  node = cockpit_json_parse (g_bytes_get_data (msg, NULL), g_bytes_get_size (msg), NULL);
+  g_assert (node);
+  metrics = json_node_get_array (node);
+  g_assert (metrics != NULL);
+  g_assert_cmpint (json_array_get_length (metrics), ==, 1);
+  values = json_array_get_array_element (metrics, 0);
+  g_assert_cmpint (json_array_get_length (values), ==, 2);
+  g_assert_cmpint (json_array_get_int_element (values, 0), >=, 0);
+  g_assert_cmpint (json_array_get_int_element (values, 1), >=, 0);
+
+  json_node_free (node);
+
+  g_object_unref (channel);
+  json_object_unref (options);
+  g_object_unref (transport);
+}
+
 int
 main (int argc,
       char *argv[])
@@ -612,8 +740,11 @@ main (int argc,
               setup, test_instances, teardown);
   g_test_add ("/metrics/dynamic-instances", TestCase, NULL,
               setup, test_dynamic_instances, teardown);
+  g_test_add_func ("/metrics/omit-instances", test_omit_instances);
 
   g_test_add_func ("/metrics/not-supported", test_not_supported);
+
+  g_test_add_func ("/metrics/deprecated-net-all", test_deprecated_net_all);
 
   return g_test_run ();
 }

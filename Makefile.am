@@ -18,7 +18,8 @@ nodist_noinst_SCRIPTS =
 dist_systemdunit_DATA   =
 nodist_systemdunit_DATA =
 
-TESTS =
+TESTS = \
+	tools/test-bots
 
 CLEANFILES = \
 	$(man_MANS) \
@@ -32,10 +33,7 @@ DISTCLEANFILES = \
 	$(NULL)
 
 EXTRA_DIST = \
-	.bowerrc \
-	bower.json \
 	package.json \
-	src/branding \
 	README.md \
 	$(NULL)
 
@@ -89,7 +87,7 @@ CLEAN_CSS = $(srcdir)/node_modules/.bin/cleancss
 
 MIN_JS_RULE = \
 	$(AM_V_GEN) $(MKDIR_P) $(dir $@) && \
-	$(srcdir)/tools/missing $(UGLIFY_JS) $^ --mangle --comments 'preserve' --beautify \
+	$(srcdir)/tools/missing $(UGLIFY_JS) $(filter-out %.deps, $^) --mangle --comments 'preserve' --beautify \
 		--source-map $@.map --source-map-url $(notdir $@).map --source-map-include-sources > $@.tmp && \
 	$(MV) $@.tmp $@
 
@@ -152,6 +150,7 @@ WEBPACK_PACKAGES = \
 	networkmanager \
 	ostree \
 	pcp \
+	packagekit \
 	playground \
 	realmd \
 	selinux \
@@ -305,7 +304,7 @@ OPENSANS_FONTS = \
 
 dist/fonts/%.woff:
 	$(V_COPY) $(MKDIR_P) $(dir $@) && \
-	cp -L $(subst dist/fonts,$(BOWER)/patternfly/dist/fonts,$@) $@.tmp && $(MV) $@.tmp $@
+	cp -L $(subst dist/fonts,$(srcdir)/node_modules/patternfly/dist/fonts,$@) $@.tmp && $(MV) $@.tmp $@
 
 EXTRA_DIST += $(OPENSANS_FONTS)
 
@@ -337,7 +336,7 @@ install-data-local:: dist/guide/html/index.html
 uninstall-local::
 	rm -rf $(DESTDIR)$(htmldir)
 
-# See tools/make-source
+# See bots/make-source
 dump-dist-gzip:
 	@echo "$(abs_builddir)/$(distdir).tar.gz"
 
@@ -347,19 +346,19 @@ COMMITTED_DIST = \
 	test/ \
 	$(NULL)
 
-# Build up the distribution using $COMMITTED_DIST and include node_modules and bower licenses
+# Build up the distribution using $COMMITTED_DIST and include node_modules licenses
 # also automatically update minimum base dependency in RPM spec file
 dist-hook::
 	( cd $(srcdir); git ls-tree HEAD --name-only -r $(COMMITTED_DIST) || (echo $(COMMITTED_DIST) | tr ' ' '\n' ) ) | \
 		tar -C $(srcdir) -cf - -T - | tar -C $(distdir) -xf -
-	tar -C $(srcdir) -cf - --exclude='phantomjs*' node_modules/ | tar -C $(distdir) -xf -
-	tar -C $(srcdir) -cf - bower_components/ | tar -C $(distdir) -xf -
 	echo $(VERSION) > $(distdir)/.tarball
-	$(srcdir)/tools/build-copying $(BOWER) > $(distdir)/COPYING.bower
+	$(srcdir)/tools/build-copying $(distdir)/node_modules > $(distdir)/COPYING.node
+	[ ! -d $(distdir)/tools/debian ] || $(srcdir)/tools/build-debian-copyright $(distdir)/node_modules > $(distdir)/tools/debian/copyright
 	[ ! -e $(distdir)/tools/cockpit.spec ] || $(srcdir)/tools/gen-spec-dependencies $(distdir)/tools/cockpit.spec
 
-DIST_TAR_MAIN = tar --format=posix -cf - --exclude='node_modules' "$(distdir)" "$(distdir)/bower.json" "$(distdir)/.bowerrc"
-DIST_TAR_CACHE = tar --format=posix -cf - "$(distdir)/node_modules" "$(distdir)/package.json"
+DIST_TAR_MAIN = tar --format=posix -cf - "$(distdir)"
+DIST_TAR_CACHE = tar --format=posix -cf - --exclude='phantomjs*' --transform="s/^/$(distdir)/" \
+	"$(srcdir)/node_modules" "$(srcdir)/package.json"
 
 DIST_ARCHIVES = \
 	cockpit-$(VERSION).tar.xz \
@@ -377,7 +376,11 @@ dist-xz: distdir
 distcheck-hook::
 	$(srcdir)/tools/check-dist $(distdir)
 
-BOWER = $(srcdir)/bower_components
+install-integration-tests::
+	$(MKDIR_P) $(DESTDIR)$(pkgdatadir)
+	( cd $(srcdir); git ls-tree HEAD --full-tree --name-only -r test || echo test ) | \
+		tar -C $(srcdir) -cf - -T - | tar -C $(DESTDIR)$(pkgdatadir) -xf -
+	rm -r $(DESTDIR)$(pkgdatadir)/test/tmp; ln -sf /var/tmp/cockpit $(DESTDIR)$(pkgdatadir)/test/tmp
 
 include po/Makefile.am
 include pkg/Makefile.am

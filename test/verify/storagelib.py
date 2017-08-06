@@ -43,6 +43,11 @@ class StorageCase(MachineCase):
 
         self.storaged_is_old_udisks = ("udisksctl" in self.storagectl_cmd and self.storaged_version < [2, 6, 0])
 
+        if "debian" in self.machine.image or "ubuntu" in self.machine.image:
+            # Debian's udisks has a patch to use FHS /media directory
+            self.mount_root = "/media"
+        else:
+            self.mount_root = "/run/media"
 
     def inode(self, f):
         return self.machine.execute("stat -L '%s' -c %%i" % f)
@@ -215,6 +220,7 @@ class StorageCase(MachineCase):
 
     def dialog_wait_error(self, field, val):
         # XXX - allow for more than one error
+        self.browser.wait_present('#dialog .dialog-error')
         self.browser.wait_in_text('#dialog .dialog-error', val)
 
     def dialog_wait_not_visible(self, field):

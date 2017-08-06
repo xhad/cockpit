@@ -1,4 +1,0 @@
-#! /bin/bash
-
-BASE=$(dirname $0)
-$BASE/virt-builder-fedora "$1" centos-7.1 x86_64

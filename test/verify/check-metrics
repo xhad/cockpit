@@ -18,9 +18,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with Cockpit; If not, see <http://www.gnu.org/licenses/>.
 
-import os
-
 import parent
+import time
+import subprocess
 from testlib import *
 
 def read_mem_info(machine):
@@ -34,6 +34,9 @@ def read_mem_info(machine):
     return info
 
 class TestMetrics(MachineCase):
+    provision = {
+        "0": { "forward": { "2000": 2000 } },
+    }
 
     def check_host_metrics(self):
         b = self.browser
@@ -112,6 +115,7 @@ class TestMetrics(MachineCase):
         #
         meminfo = read_mem_info(m)
         mem_used = meminfo['MemTotal'] - meminfo['MemFree']
+        print "Measured Memory", mem_used
         b.wait_js_func("ph_flot_data_plateau", "#server_memory_graph", mem_used*0.95, mem_used*1.05, 15, "mem");
 
         # Disk.  Anything above 100 kiB/s is good for now.
@@ -121,16 +125,52 @@ class TestMetrics(MachineCase):
         b.wait_js_func("ph_flot_data_plateau", "#server_disk_io_graph", 100*1024, None, 5, "disk io");
         m.execute("kill %d" % disk_pid)
 
-        # Network.  Anything above 300 kb/s is good for now.
+        # Network traffic through loopback. Should be ignored (fixed in 147)
+        if m.image not in ["rhel-7-4"]:
+            m.spawn("ping -w 5 -f -c 10000000 -s 50000  127.0.0.1", "load-net-lo.log")
+            try:
+                old_timeout = b.phantom.timeout
+                b.phantom.timeout = 10
+                try:
+                    b.wait_js_func("ph_flot_data_plateau", "#server_network_traffic_graph", 300*1000, None, 5, "net io");
+                finally:
+                    b.phantom.timeout = old_timeout
+                self.fail("Unexpected traffic graph for localhost")
+            except Error as ex:
+                if not ex.msg.startswith('timeout'):
+                    raise
+
+        # Network traffic through Ethernet.  Anything above 300 kb/s is good for now.
         #
-        identity = m._calc_identity()
-        m.upload([ identity ], "/var/tmp")
-        net_pid = m.spawn("ssh -o StrictHostKeyChecking=no -i /var/tmp/{1} {0} cat /dev/zero >/dev/null".format(m.address, os.path.basename(identity)), "load-net.log")
-        b.wait_js_func("ph_flot_data_plateau", "#server_network_traffic_graph", 300*1000, None, 5, "net io");
+        m.execute("if type firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --zone=public --add-port=2000/tcp && firewall-cmd --reload; fi")
+
+        (eth_before, lo_before) = m.execute(r"grep -E '\beth0:|\bens5:' /proc/net/dev | awk '{print $2 + $10}'; "
+                                            r"grep '\blo:' /proc/net/dev | awk '{print $2 + $10}'").strip().split()
+        time_before = time.time()
+
+        # -q is necessary with netcat-openbsd, but does not exist with nmap-nc
+        net_pid = m.spawn("nc `nc -h 2>&1| grep -q -- -q && echo '-q -1' || true` -l 2000 </dev/null >/dev/null", "load-net.log")
+
+        # might take several attemps until server-side is listening
+        (host, port) = m.forward["2000"].split(":")
+        client = subprocess.Popen("for retry in `seq 10`; do nc {0} {1} </dev/zero >/dev/null; sleep 1; done".format(host, port), shell=True)
+
+        try:
+            b.wait_js_func("ph_flot_data_plateau", "#server_network_traffic_graph", 300*1000, None, 5, "net io");
+        finally:
+            time_after = time.time()
+            (eth_after, lo_after) = m.execute(r"grep -E 'eth0|ens5' /proc/net/dev | awk '{print $2 + $10}'; "
+                                              r"grep '\blo:' /proc/net/dev | awk '{print $2 + $10}'").strip().split()
+            print("Measured {0:.1f}s of network traffic; eth0/ens5: {1} bytes, lo: {2} bytes".format(
+                time_after - time_before, int(eth_after) - int(eth_before), int(lo_after) - int(lo_before)))
+
+            client.terminate()
+            client.wait()
+
         m.execute("kill %d" % net_pid)
 
     @skipImage("No PCP available on Atomic", "fedora-atomic", "rhel-atomic", "continuous-atomic")
-    @skipImage("No PCP available on Debian testing/unstable", "debian-testing")
+    @skipImage("No PCP available on Debian 9/testing/unstable", "debian-stable", "debian-testing")
     def testPcp(self):
         m = self.machine
 

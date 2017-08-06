@@ -511,8 +511,6 @@ function Transport() {
             expect_disconnect = true;
             window.location.reload(true);
         }
-        if (expect_disconnect)
-            return;
         self.close();
     };
 
@@ -564,6 +562,8 @@ function Transport() {
         ws = null;
         if (ows)
             ows.close();
+        if (expect_disconnect)
+            return;
         ready_for_channels(); /* ready to fail */
 
         /* Broadcast to everyone */
@@ -694,7 +694,7 @@ function Transport() {
             ignore_health_check = data.data;
             return;
         }
-        self.send_message(JSON.stringify(data), "", data);
+        return self.send_message(JSON.stringify(data), "", data);
     };
 
     self.register = function register(channel, control_cb, message_cb) {
@@ -721,6 +721,12 @@ function ensure_transport(callback) {
         });
     }
 }
+
+/* Always close the transport explicitly: allows parent windows to track us */
+window.addEventListener("unload", function() {
+    if (default_transport)
+        default_transport.close();
+});
 
 function Channel(options) {
     var self = this;
@@ -1093,6 +1099,8 @@ function factory() {
 
     /* Not public API ... yet? */
     cockpit.hint = function hint(name, options) {
+        if (!default_transport)
+            return;
         if (!options)
             options = default_host;
         if (typeof options == "string")
@@ -1177,7 +1185,7 @@ function factory() {
     /* ------------------------------------------------------------------------------------
      * Promises.
      * Based on Q and angular promises, with some jQuery compatibility. See the angular
-     * license in COPYING.bower for license lineage. There are some key differences with
+     * license in COPYING.node for license lineage. There are some key differences with
      * both Q and jQuery.
      *
      *  * Exceptions thrown in handlers are not treated as rejections or failures.
@@ -1577,8 +1585,13 @@ function factory() {
      * Use application to prefix data stored in browser storage
      * with helpers for compatibility.
      */
-    function StorageHelper(storage) {
+    function StorageHelper(storageName) {
         var self = this;
+        var storage;
+
+        try {
+            storage = window[storageName];
+        } catch (e) { }
 
         self.prefixedKey = function (key) {
             return cockpit.transport.application() + ":" + key;
@@ -1620,8 +1633,8 @@ function factory() {
         };
     }
 
-    cockpit.localStorage = new StorageHelper(window.localStorage);
-    cockpit.sessionStorage = new StorageHelper(window.sessionStorage);
+    cockpit.localStorage = new StorageHelper("localStorage");
+    cockpit.sessionStorage = new StorageHelper("sessionStorage");
 
     /* ---------------------------------------------------------------------
      * Shared data cache.
@@ -2328,7 +2341,8 @@ function factory() {
         if (reload !== false)
             reload_after_disconnect = true;
         ensure_transport(function(transport) {
-            transport.send_control({ "command": "logout", "disconnect": true });
+            if (!transport.send_control({ "command": "logout", "disconnect": true }))
+                window.location.reload(reload_after_disconnect);
         });
         window.sessionStorage.setItem("logout-intent", "explicit");
     };
@@ -2391,7 +2405,7 @@ function factory() {
      */
 
     document.addEventListener("click", function(ev) {
-        if (in_array(ev.target.classList, 'disabled'))
+        if (ev.target.classList && in_array(ev.target.classList, 'disabled'))
           ev.stopPropagation();
     }, true);
 
@@ -2462,6 +2476,7 @@ function factory() {
             /* Undo unnecessary encoding of these */
             href = href.replace("%40", "@");
             href = href.replace("%3D", "=");
+            href = href.replace(/%2B/g, "+");
 
             var i, opt, value, query = [];
             function push_option(v) {
@@ -2575,6 +2590,10 @@ function factory() {
 
     window.addEventListener("hashchange", function() {
         last_loc = null;
+        var hash = window.location.hash;
+        if (hash.indexOf("#") === 0)
+            hash = hash.substring(1);
+        cockpit.hint("location", { "hash": hash });
         cockpit.dispatchEvent("locationchanged");
     });
 
@@ -2584,7 +2603,7 @@ function factory() {
 
     cockpit.jump = function jump(path, host) {
         if (is_array(path))
-            path = "/" + path.map(encodeURIComponent).join("/").replace("%40", "@").replace("%3D", "=");
+            path = "/" + path.map(encodeURIComponent).join("/").replace("%40", "@").replace("%3D", "=").replace(/%2B/g, "+");
         else
             path = "" + path;
         var options = { command: "jump", location: path, host: host };
@@ -3922,6 +3941,8 @@ function factory() {
         else if (problem == "authentication-not-supported")
             return _("The server refused to authenticate using any supported methods.");
         else if (problem == "unknown-hostkey")
+            return _("Untrusted host");
+        else if (problem == "unknown-host")
             return _("Untrusted host");
         else if (problem == "invalid-hostkey")
             return _("Host key is incorrect");

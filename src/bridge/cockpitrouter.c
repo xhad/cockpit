@@ -27,6 +27,7 @@
 #include "common/cockpittransport.h"
 #include "common/cockpitpipe.h"
 #include "common/cockpitpipetransport.h"
+#include "common/cockpittemplate.h"
 
 #include <string.h>
 
@@ -63,12 +64,113 @@ enum {
 };
 
 typedef struct {
+  gchar **argv;
+  gchar **environ;
+} DynamicKey;
+
+typedef struct {
+  JsonObject *config;
+
+  // Contents owned by config
+  gchar **env;
+  gchar **spawn;
+
+  GHashTable *peers;
+} DynamicPeer;
+
+static guint
+strv_hash (gconstpointer v)
+{
+  const gchar * const *strv = v;
+  guint hash = 0;
+  gint i;
+  for (i = 0; strv && strv[i] != NULL; i++)
+    hash |= g_str_hash (strv[i]);
+  return hash;
+}
+
+static gboolean
+strv_equal (gconstpointer v1,
+            gconstpointer v2)
+{
+  const gchar * const *strv1 = v1;
+  const gchar * const *strv2 = v2;
+  gint i;
+
+  if (strv1 == strv2)
+    return TRUE;
+  if (!strv1 || !strv2)
+    return FALSE;
+  for (i = 0; strv1[i] != NULL || strv2[i] != NULL; i++)
+    {
+      if (strv1[i] == NULL || strv2[i] == NULL || !g_str_equal (strv1[i], strv2[i]))
+        return FALSE;
+    }
+  return TRUE;
+}
+
+static guint
+dynamic_key_hash (gconstpointer v)
+{
+  const DynamicKey *key = v;
+  return strv_hash (key->argv) | strv_hash (key->environ);
+}
+
+static gboolean
+dynamic_key_equal (gconstpointer v1,
+                   gconstpointer v2)
+{
+  const DynamicKey *key1 = v1;
+  const DynamicKey *key2 = v2;
+  return strv_equal (key1->argv, key2->argv) && strv_equal (key1->environ, key2->environ);
+}
+
+static void
+dynamic_key_free (gpointer v)
+{
+  DynamicKey *key = v;
+  g_strfreev (key->argv);
+  g_strfreev (key->environ);
+  g_free (key);
+}
+
+static DynamicPeer *
+dynamic_peer_create (JsonObject *config)
+{
+  DynamicPeer *p = g_new0 (DynamicPeer, 1);
+
+  p->peers = g_hash_table_new_full (dynamic_key_hash, dynamic_key_equal,
+                                    dynamic_key_free, g_object_unref);
+
+  p->config = json_object_ref (config);
+  if (!cockpit_json_get_strv (config, "environ", NULL, &p->env))
+    p->env = NULL;
+
+  if (!cockpit_json_get_strv (config, "spawn", NULL, &p->spawn))
+    p->spawn = NULL;
+
+  return p;
+}
+
+static void
+dynamic_peer_free (gpointer data)
+{
+  DynamicPeer *p = data;
+  json_object_unref (p->config);
+  g_hash_table_unref (p->peers);
+  g_free (p->spawn);
+  g_free (p->env);
+  g_free (p);
+}
+
+typedef struct {
   gchar *name;
   GPatternSpec *glob;
   JsonNode *node;
 } RouterMatch;
 
 typedef struct {
+  JsonObject *config;
   RouterMatch *matches;
   gboolean (* callback) (CockpitRouter *, const gchar *, JsonObject *, GBytes *, gpointer);
   gpointer user_data;
@@ -152,7 +254,39 @@ router_rule_invoke (RouterRule *rule,
   return (rule->callback) (self, channel, options, data, rule->user_data);
 }
 
-#ifdef WITH_DEBUG
+static RouterRule *
+router_rule_find (GList *rules,
+                  JsonObject *config)
+{
+  for (GList *l = rules; l; l = g_list_next (l))
+    {
+      RouterRule *rule = l->data;
+      if (rule->config && cockpit_json_equal_object (rule->config, config))
+        return rule;
+    }
+  return NULL;
+}
+
+static void
+router_rule_destroy (RouterRule *rule)
+{
+  gint i;
+
+  if (rule->destroy)
+    (rule->destroy) (rule->user_data);
+  for (i = 0; rule->matches && rule->matches[i].name != NULL; i++)
+    {
+      g_free (rule->matches[i].name);
+      json_node_free (rule->matches[i].node);
+      if (rule->matches[i].glob)
+        g_pattern_spec_free (rule->matches[i].glob);
+    }
+  g_free (rule->matches);
+  if (rule->config)
+    json_object_unref (rule->config);
+  g_free (rule);
+}
+
 static void
 router_rule_dump (RouterRule *rule)
 {
@@ -160,27 +294,26 @@ router_rule_dump (RouterRule *rule)
   gchar *text;
   guint i;
 
-  g_debug ("rule:");
+  g_print ("rule:\n");
   for (i = 0; rule->matches && rule->matches[i].name != NULL; i++)
     {
       match = &rule->matches[i];
       if (match->node)
         {
           text = cockpit_json_write (match->node, NULL);
-          g_debug ("  %s: %s", match->name, text);
+          g_print ("  %s: %s\n", match->name, text);
           g_free (text);
         }
       else if (match->glob)
         {
-          g_debug ("  %s: glob", match->name);
+          g_print ("  %s: glob\n", match->name);
         }
       else
         {
-          g_debug ("  %s", match->name);
+          g_print ("  %s\n", match->name);
         }
     }
 }
-#endif
 
 static void
 process_init (CockpitRouter *self,
@@ -247,6 +380,7 @@ on_channel_closed (CockpitChannel *local,
 
   channel = cockpit_channel_get_id (local);
   g_hash_table_remove (self->channels, channel);
+  g_hash_table_remove (self->groups, channel);
 
   /*
    * If this was the last channel in the fence group then resume all other channels
@@ -286,6 +420,96 @@ create_channel (CockpitRouter *self,
 }
 
 static gboolean
+is_empty (const gchar *s)
+{
+  return !s || s[0] == '\0';
+}
+
+/*
+ * For backwards compatibility we need to normalize some host params
+ * so they can be matched against.
+ *
+ * Some sessions shouldn't be shared by multiple channels, such as those that
+ * explicitly specify a host-key or specific user. This changed over time
+ * so modify things to make it a simple match.
+ *
+ * If the given user is the current user, remove it. Preserves the current
+ * behavior.
+ *
+ */
+static void
+cockpit_router_normalize_host_params (JsonObject *options)
+{
+  const gchar *sharable = NULL;
+  const gchar *user = NULL;
+  gboolean needs_private = FALSE;
+
+  if (!cockpit_json_get_string (options, "session", NULL, &sharable))
+    sharable = NULL;
+
+  if (!cockpit_json_get_string (options, "user", NULL, &user))
+    user = NULL;
+
+  if (!sharable)
+    {
+      /* Fallback to older ways of indicating this */
+      if (user || json_object_has_member (options, "host-key"))
+        needs_private = TRUE;
+
+      if (json_object_has_member (options, "temp-session"))
+        {
+          if (needs_private && !cockpit_json_get_bool (options, "temp-session",
+                                                       TRUE, &needs_private))
+            needs_private = TRUE;
+          json_object_remove_member (options, "temp-session");
+        }
+    }
+
+  if (g_strcmp0 (user, g_get_user_name ()) == 0)
+    json_object_remove_member (options, "user");
+
+  if (needs_private)
+    json_object_set_string_member (options, "session", "private");
+}
+
+static gboolean
+cockpit_router_normalize_host (CockpitRouter *self,
+                               JsonObject *options)
+{
+  const gchar *host;
+  gchar *actual_host = NULL;
+  gchar *key = NULL;
+  gchar **parts = NULL;
+
+  if (!cockpit_json_get_string (options, "host", self->init_host, &host))
+    return FALSE;
+
+  parts = g_strsplit (host, "+", 3);
+  if (g_strv_length (parts) == 3 && !is_empty (parts[0]) &&
+      !is_empty (parts[1]) && !is_empty (parts[2]))
+    {
+      key = g_strdup_printf ("host-%s", parts[1]);
+      if (!json_object_has_member (options, key))
+        {
+          json_object_set_string_member (options, key, parts[2]);
+          actual_host = parts[0];
+        }
+    }
+
+  if (!actual_host)
+    actual_host = (gchar *) host;
+
+  if (g_strcmp0 (self->init_host, actual_host) == 0)
+    json_object_remove_member (options, "host");
+  else if (g_strcmp0 (host, actual_host) != 0)
+    json_object_set_string_member (options, "host", actual_host);
+
+  g_strfreev (parts);
+  g_free (key);
+  return TRUE;
+}
+
+static gboolean
 process_open_channel (CockpitRouter *self,
                       const gchar *channel,
                       JsonObject *options,
@@ -296,17 +520,16 @@ process_open_channel (CockpitRouter *self,
   GType channel_type = 0;
   const gchar *group;
 
-  if (!cockpit_json_get_string (options, "group", NULL, &group))
+  if (!cockpit_json_get_string (options, "group", "default", &group))
     g_warning ("%s: caller specified invalid 'group' field in open message", channel);
 
   g_assert (type_function != NULL);
   channel_type = type_function ();
 
-  if (group && g_str_equal (group, "fence"))
+  if (g_str_equal (group, "fence"))
     g_hash_table_add (self->fences, g_strdup (channel));
 
-  if (group)
-    g_hash_table_insert (self->groups, g_strdup (channel), g_strdup (group));
+  g_hash_table_insert (self->groups, g_strdup (channel), g_strdup (group));
 
   create_channel (self, channel, options, channel_type);
   return TRUE;
@@ -320,6 +543,120 @@ process_open_peer (CockpitRouter *self,
                    gpointer user_data)
 {
   CockpitPeer *peer = user_data;
+  return cockpit_peer_handle (peer, channel, options, data);
+}
+
+static GBytes *
+substitute_json_string (const gchar *variable,
+                        gpointer user_data)
+{
+  const gchar *value;
+  JsonObject *options = user_data;
+  if (options && cockpit_json_get_string (options, variable, "", &value))
+    return g_bytes_new (value, strlen (value));
+  else if (options)
+    g_message ("Couldn't get argument for bridge: got invalid value for '%s'", variable);
+
+  return g_bytes_new ("", 0);
+}
+
+static JsonArray *
+strv_to_json_array (gchar **strv)
+{
+  gint i;
+  JsonArray *array = json_array_new ();
+  g_assert (strv != NULL);
+  for (i = 0; strv[i] != NULL; i++)
+    json_array_add_string_element (array, strv[i]);
+  return array;
+}
+
+static void
+add_dynamic_args_to_array (gchar ***key,
+                           gchar **config_args,
+                           JsonObject *options)
+{
+  GPtrArray *arr = NULL;
+  gint length;
+  gint i;
+
+  g_assert (config_args != NULL);
+  g_assert (key != NULL);
+
+  arr = g_ptr_array_new ();
+  length = g_strv_length (config_args);
+  for (i = 0; i < length; i++)
+    {
+      GString *s = g_string_new ("");
+      GBytes *input = g_bytes_new_static (config_args[i], strlen(config_args[i]) + 1);
+      GList *output = cockpit_template_expand (input, substitute_json_string,
+                                               "${", "}", options);
+      GList *l;
+      for (l = output; l != NULL; l = g_list_next (l))
+        {
+          gsize size;
+          gconstpointer data = g_bytes_get_data (l->data, &size);
+          g_string_append_len (s, data, size);
+        }
+
+      g_ptr_array_add (arr, g_string_free (s, FALSE));
+      g_bytes_unref (input);
+      g_list_free_full (output, (GDestroyNotify) g_bytes_unref);
+    }
+
+  g_ptr_array_add (arr, NULL);
+  *key = (gchar **)g_ptr_array_free (arr, FALSE);
+}
+
+static gboolean
+process_open_dynamic_peer (CockpitRouter *self,
+                           const gchar *channel,
+                           JsonObject *options,
+                           GBytes *data,
+                           gpointer user_data)
+{
+  CockpitPeer *peer = NULL;
+  DynamicKey key = { NULL, NULL };
+  DynamicPeer *dp = user_data;
+  JsonObject *config = NULL;
+  GList *l, *names = NULL;
+
+  if (dp->spawn)
+    add_dynamic_args_to_array (&key.argv, dp->spawn, options);
+
+  if (dp->env)
+    add_dynamic_args_to_array (&key.environ, dp->env, options);
+
+  peer = g_hash_table_lookup (dp->peers, &key);
+  if (!peer)
+    {
+      config = json_object_new ();
+      names = json_object_get_members (dp->config);
+      for (l = names; l != NULL; l = g_list_next (l))
+        {
+          if (!g_str_equal (l->data, "spawn") && !g_str_equal (l->data, "environ"))
+            json_object_set_member (config, l->data, json_object_dup_member (dp->config, l->data));
+        }
+
+      if (key.argv)
+        json_object_set_array_member (config, "spawn", strv_to_json_array (key.argv));
+
+      if (key.environ)
+        json_object_set_array_member (config, "environ", strv_to_json_array (key.environ));
+
+      peer = cockpit_peer_new (self->transport, config);
+      g_hash_table_insert (dp->peers, g_memdup (&key, sizeof (DynamicKey)), peer);
+    }
+  else
+    {
+      g_strfreev (key.argv);
+      g_strfreev (key.environ);
+    }
+
+  if (config)
+    json_object_unref (config);
+
+  g_list_free (names);
   return cockpit_peer_handle (peer, channel, options, data);
 }
 
@@ -351,7 +688,6 @@ process_open (CockpitRouter *self,
               JsonObject *options,
               GBytes *data)
 {
-  const gchar *host;
   GList *l;
   GBytes *new_payload = NULL;
 
@@ -379,7 +715,7 @@ process_open (CockpitRouter *self,
       cockpit_transport_emit_control (self->transport, "open", channel, options, data);
     }
 
-  else if (!cockpit_json_get_string (options, "host", self->init_host, &host))
+  else if (!cockpit_router_normalize_host (self, options))
     {
       g_warning ("%s: caller specified invalid 'host' field in open message", channel);
       process_open_not_supported (self, channel, options, data, NULL);
@@ -388,9 +724,7 @@ process_open (CockpitRouter *self,
   /* Now go throgh the rules */
   else
     {
-      if (g_strcmp0 (self->init_host, host) == 0)
-        json_object_remove_member (options, "host");
-
+      cockpit_router_normalize_host_params (options);
       new_payload = cockpit_json_write_bytes (options);
       for (l = self->rules; l != NULL; l = g_list_next (l))
         {
@@ -409,11 +743,9 @@ static void
 process_kill (CockpitRouter *self,
               JsonObject *options)
 {
-  CockpitChannel *channel;
   GHashTableIter iter;
   const gchar *group = NULL;
   const gchar *host = NULL;
-  gpointer id, value;
   GList *list, *l;
 
   if (!cockpit_json_get_string (options, "group", NULL, &group))
@@ -433,25 +765,39 @@ process_kill (CockpitRouter *self,
 
   list = NULL;
   if (group)
-    g_hash_table_iter_init (&iter, self->groups);
-  else
-    g_hash_table_iter_init (&iter, self->channels);
-  while (g_hash_table_iter_next (&iter, &id, &value))
     {
-      if (group && !g_str_equal (group, value))
-        continue;
-      channel = g_hash_table_lookup (self->channels, id);
-      if (channel)
+      gpointer id, channel_group;
+
+      g_hash_table_iter_init (&iter, self->groups);
+      while (g_hash_table_iter_next (&iter, &id, &channel_group))
         {
-          g_debug ("killing channel: %s", (gchar *)id);
-          list = g_list_prepend (list, g_object_ref (channel));
+          CockpitChannel *channel;
+
+          if (!g_str_equal (group, channel_group))
+            continue;
+
+          channel = g_hash_table_lookup (self->channels, id);
+          if (channel)
+            list = g_list_prepend (list, g_object_ref (channel));
         }
+    }
+  else
+    {
+      gpointer id, channel;
+
+      g_hash_table_iter_init (&iter, self->channels);
+      while (g_hash_table_iter_next (&iter, &id, &channel))
+        list = g_list_prepend (list, g_object_ref (channel));
     }
 
   for (l = list; l != NULL; l = g_list_next (l))
     {
-      cockpit_channel_close (l->data, "terminated");
-      g_object_unref (l->data);
+      CockpitChannel *channel = l->data;
+
+      g_debug ("killing channel: %s", cockpit_channel_get_id (channel));
+      cockpit_channel_close (channel, "terminated");
+
+      g_object_unref (channel);
     }
 
   g_list_free (list);
@@ -544,9 +890,6 @@ static void
 cockpit_router_dispose (GObject *object)
 {
   CockpitRouter *self = COCKPIT_ROUTER (object);
-  RouterRule *rule;
-  GList *l;
-  gint i;
 
   if (self->signal_id)
     {
@@ -558,22 +901,7 @@ cockpit_router_dispose (GObject *object)
   g_hash_table_remove_all (self->groups);
   g_hash_table_remove_all (self->fences);
 
-  for (l = self->rules; l != NULL; l = g_list_next (l))
-    {
-      rule = l->data;
-      if (rule->destroy)
-        (rule->destroy) (rule->user_data);
-      for (i = 0; rule->matches && rule->matches[i].name != NULL; i++)
-        {
-          g_free (rule->matches[i].name);
-          json_node_free (rule->matches[i].node);
-          if (rule->matches[i].glob)
-            g_pattern_spec_free (rule->matches[i].glob);
-        }
-      g_free (rule->matches);
-      g_free (rule);
-    }
-  g_list_free (self->rules);
+  g_list_free_full (self->rules, (GDestroyNotify)router_rule_destroy);
   self->rules = NULL;
 }
 
@@ -670,10 +998,8 @@ cockpit_router_new (CockpitTransport *transport,
                     GList *bridges)
 {
   CockpitRouter *router;
-  CockpitPeer *peer;
-  JsonObject *match;
-  GList *l;
   guint i;
+  JsonObject *match;
 
   g_return_val_if_fail (transport != NULL, NULL);
 
@@ -692,22 +1018,9 @@ cockpit_router_new (CockpitTransport *transport,
   /* No hosts are allowed by default */
   cockpit_router_ban_hosts (router);
 
-  /* Enumerated in reverse, since the last rule is matched first */
-  for (l = g_list_last (bridges); l != NULL; l = g_list_previous (l))
-    {
-      /* Actual descriptive warning displayed elsewhere */
-      if (!cockpit_json_get_object (l->data, "match", NULL, &match))
-        match = NULL;
+  cockpit_router_set_bridges (router, bridges);
 
-      peer = cockpit_peer_new (transport, l->data);
-      cockpit_router_add_bridge (router, match, peer);
-      g_object_unref (peer);
-    }
-
-#ifdef WITH_DEBUG
-  for (l = router->rules; l != NULL; l = g_list_next (l))
-    router_rule_dump (l->data);
-#endif
+  // cockpit_router_dump_rules (router);
 
   return router;
 }
@@ -744,31 +1057,26 @@ cockpit_router_add_channel (CockpitRouter *self,
 }
 
 /**
- * cockpit_router_add_bridge:
+ * cockpit_router_add_peer:
  * @self: The router object
  * @match: JSON configuration on what to match
- * @config: The peer bridge config
+ * @peer: The CockpitPeer instance to route matches to
  *
  * Add a peer bridge to the router for handling channels.
  * The @match JSON object as described in doc/guide/ and
  * matches against "open" messages in order to determine whether
  * to send channels to this peer bridge.
- *
- * The @config is the peer bridge config passed to
- * cockpit_peer_new().
- *
- * Returns: The new peer bridge.
  */
-CockpitPeer *
-cockpit_router_add_bridge (CockpitRouter *self,
-                           JsonObject *match,
-                           CockpitPeer *peer)
+void
+cockpit_router_add_peer (CockpitRouter *self,
+                         JsonObject *match,
+                         CockpitPeer *peer)
 {
   RouterRule *rule;
 
-  g_return_val_if_fail (COCKPIT_IS_ROUTER (self), NULL);
-  g_return_val_if_fail (match != NULL, NULL);
-  g_return_val_if_fail (COCKPIT_IS_PEER (peer), NULL);
+  g_return_if_fail (COCKPIT_IS_ROUTER (self));
+  g_return_if_fail (COCKPIT_IS_PEER (peer));
+  g_return_if_fail (match != NULL);
 
   rule = g_new0 (RouterRule, 1);
   rule->callback = process_open_peer;
@@ -777,6 +1085,111 @@ cockpit_router_add_bridge (CockpitRouter *self,
   router_rule_compile (rule, match);
 
   self->rules = g_list_prepend (self->rules, rule);
+}
 
-  return peer;
+void
+cockpit_router_add_bridge (CockpitRouter *self,
+                           JsonObject *config)
+{
+  RouterRule *rule;
+  JsonObject *match;
+  GList *output = NULL;
+  GBytes *bytes = NULL;
+
+  g_return_if_fail (COCKPIT_IS_ROUTER (self));
+  g_return_if_fail (config != NULL);
+
+  /* Actual descriptive warning displayed elsewhere */
+  if (!cockpit_json_get_object (config, "match", NULL, &match))
+    match = NULL;
+
+  /* See if we have any variables in the JSON */
+  bytes = cockpit_json_write_bytes (config);
+  output = cockpit_template_expand (bytes, substitute_json_string,
+                                    "${", "}", NULL);
+  rule = g_new0 (RouterRule, 1);
+  rule->config = json_object_ref (config);
+
+  if (!output->next)
+    {
+      rule->callback = process_open_peer;
+      rule->user_data = cockpit_peer_new (self->transport, config);
+      rule->destroy = g_object_unref;
+    }
+  else
+    {
+      rule->callback = process_open_dynamic_peer;
+      rule->user_data = dynamic_peer_create (config);
+      rule->destroy = dynamic_peer_free;
+    }
+
+  router_rule_compile (rule, match);
+  self->rules = g_list_prepend (self->rules, rule);
+
+  g_bytes_unref (bytes);
+  g_list_free_full (output, (GDestroyNotify) g_bytes_unref);
+}
+
+/**
+ * cockpit_router_set_bridges:
+ * @self: The router object
+ * @configs: JSON configurations for the bridges
+ *
+ * Updates the rules for bridges to match @configs.  All rules that
+ * have been previously added via @cockpit_router_add_bridge and
+ * @cockpit_router_set_bridges conceptually removed, and all rules
+ * specified by @configs are added as with @cockpit_add_bridge.
+ *
+ * External peers for rules that have not changed will be left
+ * running.  Peers for rules that have disappeared will be terminated.
+ */
+void cockpit_router_set_bridges (CockpitRouter *self,
+                                 GList *bridges)
+{
+  GList *l;
+  JsonObject *config;
+  RouterRule *rule;
+  GList *old_rules;
+
+  /* Enumerated in reverse, since the last rule is matched first */
+
+  old_rules = self->rules;
+  self->rules = NULL;
+  for (l = g_list_last (bridges); l != NULL; l = g_list_previous (l))
+    {
+      config = l->data;
+
+      rule = router_rule_find (old_rules, config);
+      if (rule)
+        {
+          old_rules = g_list_remove (old_rules, rule);
+          self->rules = g_list_prepend (self->rules, rule);
+        }
+      else
+        {
+          cockpit_router_add_bridge (self, config);
+        }
+    }
+
+  for (l = old_rules; l; l = g_list_next (l))
+    {
+      rule = l->data;
+      if (rule->config)
+        {
+          router_rule_destroy (rule);
+        }
+      else
+        {
+          self->rules = g_list_append (self->rules, rule);
+        }
+    }
+  g_list_free (old_rules);
+}
+
+void
+cockpit_router_dump_rules (CockpitRouter *self)
+{
+  GList *l;
+  for (l = self->rules; l != NULL; l = g_list_next (l))
+    router_rule_dump (l->data);
 }

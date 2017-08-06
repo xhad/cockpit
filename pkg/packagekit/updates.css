@@ -1,0 +1,237 @@
+/* override default cockpit CSS, as this doesn't fit our table */
+table.listing-ct thead th:last-child {
+    text-align: left;
+}
+
+tr.listing-ct-item td:last-child {
+    text-align: left;
+}
+
+tr.listing-ct-item th {
+    vertical-align: top;
+}
+
+tr.listing-ct-item td {
+    vertical-align: top;
+}
+
+tr.listing-ct-item td.narrow {
+    max-width: 18ex;
+    word-wrap: break-word;
+}
+
+tr.listing-ct-item td.changelog {
+    white-space: pre-wrap;
+}
+
+tr.security.listing-ct-item {
+    background-color: #fbf0f0;
+    border-top: 1px solid #e0e0e0;
+    border-bottom: 1px solid #e0e0e0;
+}
+
+
+/* Reformat table for narrow widths */
+@media screen and (max-width: 640px) {
+    .listing-ct {
+        /* counteract .container-fluid */
+        margin: 0 0 0 -20px;
+        width: 100vw;
+        overflow: hidden;
+    }
+    .listing-ct thead {
+        display: none;
+    }
+    .listing-ct-item {
+        display: block;
+        width: 100vw;
+    }
+    .listing-ct-item th,
+    .listing-ct-item td {
+        display: block;
+        width: 100%;
+        max-width: 100% !important;
+        padding: 10px 15px !important;
+    }
+    .listing-ct-item th + td,
+    .listing-ct-item td + td {
+        padding-top: 0 !important;
+    }
+}
+
+@media screen and (min-width: 641px) {
+    tr.listing-ct-item td.changelog {
+        width: 80ex;
+        white-space: pre-line;
+     }
+
+     .listing-ct-item td.narrow:nth-child(2) {
+         max-width: 25ex;
+    }
+}
+
+@media screen and (min-width: 641px) and (max-width: 1150px) {
+    .listing-ct-item th {
+        min-width: 30%;
+    }
+
+    /* This really should be .update-bugs or similar */
+    .listing-ct-item td.narrow:nth-child(3) {
+        min-width: 19ex;
+        width: 20ex;
+    }
+    /* Basically children of the above, but break before the odd bug links */
+    .listing-ct-item td.narrow:nth-child(3) a:nth-child(odd):before {
+        display: block;
+        content: '';
+    }
+}
+
+@media screen and (min-width: 1151px) {
+    /* This really should be .update-bugs or similar */
+    .listing-ct-item td.narrow:nth-child(3) {
+        min-width: 36ex;
+        width: 38ex;
+    }
+    /* Basically children of the above, but break before the odd bug links */
+    .listing-ct-item td.narrow:nth-child(3) a:nth-child(4n+5):before {
+        display: block;
+        content: '';
+    }
+}
+
+.info-expander {
+    display: block;
+}
+
+.security-label {
+    color: darkred;
+}
+
+.security-label-text {
+    color: darkred;
+    font-weight: 600;
+}
+
+/* don't let the install progress bar get too wide */
+.progress-main-view {
+    max-width: 60rem;
+    margin: 10ex auto 0;
+}
+
+/* stolen from pkg/systemd/host.css */
+.content-header-extra {
+    background: #f5f5f5;
+    border-bottom: 1px solid #ddd;
+    padding: 10px 20px;
+    width: 100%;
+    position: fixed;
+    z-index: 900;
+    top: 0;
+}
+
+.container-fluid {
+    margin-top: 5em;
+}
+
+/* fixed width to avoid jumpy text between expanded/collapsed */
+.expander-caret {
+    width: 2ex;
+}
+
+.expander-title {
+    margin-bottom: 2em;
+    display: flex;
+    align-items: center;
+}
+
+.expander-title hr {
+    flex: auto;
+}
+
+.expander-title span {
+    padding: 1ex;
+    flex: none;
+}
+
+/* http://www.patternfly.org/pattern-library/communication/empty-state/ has a
+ * gray background which we don't want here */
+
+.blank-slate-pf {
+    background: inherit;
+    border: none;
+}
+
+/* standard blank-slate-pf does not limit width of paragraph, which looks ugly */
+.blank-slate-pf p {
+    max-width: 50rem;
+    margin: 0 auto;
+    text-align: center;
+}
+
+.flow-list-blank-slate {
+    padding-top: 8em;
+    margin: 0 auto;
+    max-width: 69rem;
+    text-align: center;
+}
+
+.flow-list {
+    margin: 1em 1em 3em;
+    padding: 0;
+    max-width: 110rem;
+    text-align: left;
+    box-sizing: border-box;
+}
+
+.flow-list li {
+    text-align: left;
+    box-sizing: border-box;
+    width: 22rem;
+    padding: 0 1ex;
+    display: inline-block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-weight: 600;
+}
+
+.update-log {
+    padding-top: 8em;
+    margin: 0 auto;
+    max-width: 69rem;
+    text-align: center;
+}
+
+.update-log-content {
+    margin: 0 10ex;
+    height: 13em;
+    overflow-y: auto;
+}
+
+.update-log th {
+    text-align: left;
+    padding-right: 3ex;
+}
+
+.update-log td {
+    text-align: left;
+}
+
+/* Layout fix for tooltip arrows.
+ *
+ * Sometimes when there are non-integer coordinates involved
+ * somewhere, rounding seems to make it so that there is a visible one
+ * pixel gap between tooltip-inner and tooltip-arrow.  We avoid that
+ * gap by letting the arrow and inner parts overlap by one pixel.
+ *
+ * This happens within the caption of the content listing.
+ */
+
+.tooltip.top .tooltip-arrow {
+    bottom: 1px;
+}
+
+.tooltip.bottom .tooltip-arrow {
+    top: 1px;
+}

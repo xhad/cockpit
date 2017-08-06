@@ -32,8 +32,8 @@ base_dir = os.path.dirname(os.path.realpath(__file__))
 testdir = os.path.abspath(os.path.join(base_dir, ".."))
 sys.path.append(testdir)
 
-from common import testinfra
 from common import testlib
+from common import testvm
 
 def check_valid(filename):
     name = os.path.basename(filename)
@@ -41,30 +41,6 @@ def check_valid(filename):
     if not all(c in allowed for c in name):
         return None
     return name.replace("-", "_")
-
-def install(opts):
-    sys.stderr.write("Building and installing Cockpit ...\n")
-    cmds = [
-        [ os.path.join(testdir, "vm-download"), testinfra.DEFAULT_IMAGE ],
-        [ os.path.join(testdir, "vm-reset") ],
-        [ os.path.join(testdir, "vm-install"), "--containers" ],
-    ]
-
-    if opts.sit:
-        cmds[-1].append("--sit")
-
-    if opts.container == 'kubernetes':
-        cmds.append([ os.path.join(testdir, "vm-download"), 'openshift' ])
-        cmds.append([ os.path.join(testdir, "vm-install"),
-                                    "--install-only",
-                                    "--containers",
-                                    "openshift" ])
-
-    if opts.sit:
-        cmds[-1].append("--sit")
-
-    for cmd in cmds:
-        subprocess.check_call(cmd)
 
 def run(opts):
     # Now actually load the tests, any modules that start with "check-*"
@@ -84,16 +60,11 @@ def run(opts):
 
 def main():
     parser = testlib.arg_parser()
-    parser.add_argument('-i', '--install', dest="install", action='store_true',
-                        help='Install rpms')
     parser.add_argument('-c', '--container', dest="container", action='store',
                         help='container to test')
     opts = parser.parse_args()
     if not opts.container:
         opts.container = 'kubernetes'
-
-    if opts.install:
-        install(opts)
 
     if not os.path.isdir(os.path.abspath(os.path.join(testdir, "..", "containers", opts.container))):
         sys.stderr.write("Unable to run tests for unknown container {0}.\n".format(opts.container))

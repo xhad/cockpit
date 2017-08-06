@@ -216,9 +216,13 @@ var ContainerList = React.createClass({
                 state = util.render_container_status(container.State)
             }
 
+            var image = container.Image;
+            if (container.ImageID && image == container.ImageID)
+                image = docker.truncate_id(image);
+
             var columns = [
                 { name: container.Name.replace(/^\//, ''), header: true },
-                docker.truncate_id(container.Image),
+                image,
                 util.render_container_cmdline(container),
                 util.format_cpu_usage(container.CpuUsage),
                 util.format_memory_and_limit(container.MemoryUsage, container.MemoryLimit),
@@ -328,10 +332,10 @@ var ImageSecurity = React.createClass({
         };
 
         if (info.successful === false) {
-            text = _('The scan from $time ($type) was not successful.');
+            text = _("The scan from $time ($type) was not successful.");
 
         } else if (info.vulnerabilities.length === 0) {
-            text = _('The scan from $time ($type) found no vulnerabilities.');
+            text = _("The scan from $time ($type) found no vulnerabilities.");
 
         } else {
             text = cockpit.ngettext('The scan from $time ($type) found one vulnerability:',
@@ -539,14 +543,14 @@ var ImageList = React.createClass({
         var tabs = [];
 
         tabs.push({
-            name: _('Details'),
+            name: _("Details"),
             renderer: ImageDetails,
             data: { image: image }
         });
 
         if (vulnerableInfo !== undefined) {
             tabs.push({
-                name: _('Security'),
+                name: _("Security"),
                 renderer: ImageSecurity,
                 data: {
                     image: image,

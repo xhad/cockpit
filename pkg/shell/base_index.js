@@ -28,6 +28,13 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
     var shell_embedded = window.location.pathname.indexOf(".html") !== -1;
     var _ = cockpit.gettext;
 
+    function component_checksum(machine, component) {
+        var parts = component.split("/");
+        var pkg = parts[0];
+        if (machine.manifests && machine.manifests[pkg] && machine.manifests[pkg][".checksum"])
+            return "$" + machine.manifests[pkg][".checksum"];
+    }
+
     function Frames(index) {
         var self = this;
 
@@ -140,14 +147,31 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
                 frame.style.display = "none";
 
                 var base, checksum;
-                if (machine)
-                    checksum = machine.checksum;
-                if (host === "localhost")
-                    base = "..";
-                else if (checksum)
-                    base = "../../" + checksum;
-                else
+                if (machine) {
+                    if (machine.manifests && machine.manifests[".checksum"])
+                        checksum = "$" + machine.manifests[".checksum"];
+                    else
+                        checksum = machine.checksum;
+                }
+
+                if (checksum && checksum == component_checksum(machine, component)) {
+                     if (host === "localhost")
+                         base = "..";
+                    else
+                        base = "../../" + checksum;
+                } else {
+                    /* If we don't have any checksums, or if the component specifies a different
+                       checksum than the machine, load it via a non-caching @<host> path.  This
+                       makes sure that we get the right files, and also that we don't poisen the
+                       cache with wrong files.
+
+                       We can't use a $<component-checksum> path since cockpit-ws only knows how to
+                       route the machine checksum.
+
+                       TODO - make it possible to use $<component-checksum>.
+                    */
                     base = "../../@" + host;
+                }
 
                 frame.url = base + "/" + component;
                 if (component.indexOf("/") === -1)
@@ -185,8 +209,11 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
             /* Only control messages with a channel are forwardable */
             if (control) {
                 if (control.channel !== undefined) {
-                    for (seed in source_by_seed)
-                        source_by_seed[seed].window.postMessage(message, origin);
+                    for (seed in source_by_seed) {
+                        source = source_by_seed[seed];
+                        if (!source.window.closed)
+                            source.window.postMessage(message, origin);
+                    }
                 } else if (control.command == "hint") {
                     if (control.credential) {
                         if (index.privileges)
@@ -201,7 +228,8 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
                     seed = channel.substring(0, pos + 1);
                     source = source_by_seed[seed];
                     if (source) {
-                        source.window.postMessage(message, origin);
+                        if (!source.window.closed)
+                            source.window.postMessage(message, origin);
                         return false; /* Stop delivery */
                     }
                 }
@@ -241,7 +269,11 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
         }
 
         function on_unload(ev) {
-            var source = source_by_name[ev.target.defaultView.name];
+            var source;
+            if (ev.target.defaultView)
+                source = source_by_name[ev.target.defaultView.name];
+            else if (ev.view)
+                source = source_by_name[ev.view.name];
             if (source)
                 unregister(source);
         }
@@ -264,8 +296,11 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
             var frame = child.frameElement;
             if (frame)
                 frame.removeEventListener("load", on_load);
-            child.removeEventListener("unload", on_unload);
-            child.removeEventListener("hashchange", on_hashchange);
+            /* This is often invalid when the window is closed */
+            if (child.removeEventListener) {
+                child.removeEventListener("unload", on_unload);
+                child.removeEventListener("hashchange", on_hashchange);
+            }
             delete source_by_seed[source.channel_seed];
             delete source_by_name[source.name];
         }
@@ -317,11 +352,35 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
             var forward_command = false;
             var data = event.data;
             var child = event.source;
-            if (!child || typeof data !== "string")
+            if (!child)
                 return;
 
-            var source = source_by_name[child.name];
-            var control;
+            /* If it's binary data just send it.
+             * TODO: Once we start restricting what frames can
+             * talk to which hosts, we need to parse control
+             * messages here, and cross check channels */
+            if (data instanceof window.ArrayBuffer) {
+                cockpit.transport.inject(data, true);
+                return;
+            }
+
+            if (typeof data !== "string")
+                return;
+
+            var source, control;
+
+            /*
+             * On Internet Explorer we see Access Denied when non Cockpit
+             * frames send messages (such as Javascript console). This also
+             * happens when the window is closed.
+             */
+            try {
+                source = source_by_name[child.name];
+            } catch(ex) {
+                console.log("received message from child with in accessible name: ", ex);
+                return;
+            }
+
 
             /* Closing the transport */
             if (data.length === 0) {
@@ -336,7 +395,12 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
                 if (control.command === "init") {
                     if (source)
                         unregister(source);
-                    source = register(child);
+                    if (control.problem) {
+                        console.warn("child frame failed to init: " + control.problem);
+                        source = null;
+                    } else {
+                        source = register(child);
+                    }
                     if (source) {
                         var reply = $.extend({ }, cockpit.transport.options,
                             { command: "init", "host": source.default_host, "channel-seed": source.channel_seed }
@@ -397,7 +461,8 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
 
         self.hint = function hint(child, data) {
             var message, source = source_by_name[child.name];
-            if (source && source.inited) {
+            /* This is often invalid when the window is closed */
+            if (source && source.inited && !source.window.closed) {
                 data.command = "hint";
                 message = "\n" + JSON.stringify(data);
                 source.window.postMessage(message, origin);
@@ -441,7 +506,7 @@ var phantom_checkpoint = phantom_checkpoint || function () { };
         /* Handles an href link as seen below */
         $(document).on("click", "a[href]", function(ev) {
             var a = this;
-            if (window.location.host === a.host) {
+            if (!a.host || window.location.host === a.host) {
                 self.jump(a.getAttribute('href'));
                 ev.preventDefault();
                 phantom_checkpoint();

@@ -18,12 +18,15 @@
         <registry-imagestream-body imagestream="stream" imagestream-modify="modifyImageStream"
             project-modify="modifyProject" project-sharing="sharedImages">
         </registry-imagestream-body>
-        <registry-imagestream-push settings="settings" imagestream="stream">
+        <registry-imagestream-push settings="settings" imagestream="stream" ng-show="showDockerPushCommands">
         </registry-imagestream-push>
     </div>
     <h3 translate>Images</h3>
-    <div image-listing>
-    </div>
+    <registry-image-listing imagestream="stream" image-by-tag="imageByTag"
+                            settings="settings" shared-images="sharedImages"
+                            actions="actions" image-tag-names="imageTagNames">
+    </registry-image-listing>
+
     <h3 translate ng-if="stream.metadata.annotations">Metadata</h3>
     <div class="listing-ct-body" ng-if="stream.metadata.annotations">
         <registry-imagestream-meta imagestream="stream">

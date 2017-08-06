@@ -143,54 +143,6 @@ typedef struct {
 } CockpitChannelResponse;
 
 static gboolean
-redirect_to_checksum_path (CockpitWebService *service,
-                           CockpitWebResponse *response,
-                           const gchar *checksum,
-                           const gchar *path)
-{
-  CockpitCreds *creds;
-  gchar *location;
-  const gchar *body;
-  GBytes *bytes;
-  gboolean ret;
-  gsize length;
-
-  creds = cockpit_web_service_get_creds (service);
-  if (cockpit_web_response_get_url_root (response))
-    {
-      location = g_strdup_printf ("%s/%s/$%s%s",
-                                  cockpit_web_response_get_url_root (response),
-                                  cockpit_creds_get_application (creds),
-                                  checksum, path);
-    }
-  else
-    {
-      location = g_strdup_printf ("/%s/$%s%s",
-                                  cockpit_creds_get_application (creds),
-                                  checksum, path);
-    }
-
-
-  body = "<html><head><title>Temporary redirect</title></head>"
-         "<body>Access via checksum</body></html>";
-
-  length = strlen (body);
-  cockpit_web_response_headers (response, 307, "Temporary Redirect", length,
-                                "Content-Type", "text/html",
-                                "Location", location,
-                                NULL);
-  g_free (location);
-
-  bytes = g_bytes_new_static (body, length);
-  ret = cockpit_web_response_queue (response, bytes);
-  if (ret)
-    cockpit_web_response_complete (response);
-  g_bytes_unref (bytes);
-
-  return ret;
-}
-
-static gboolean
 ensure_headers (CockpitChannelResponse *chesp,
                 guint status,
                 const gchar *reason)
@@ -597,9 +549,11 @@ cockpit_channel_response_serve (CockpitWebService *service,
   gchar *val = NULL;
   gboolean handled = FALSE;
   GHashTableIter iter;
-  const gchar *checksum = NULL;
   JsonObject *object = NULL;
   JsonObject *heads;
+  GIOStream *connection;
+  const gchar *protocol;
+  const gchar *http_host = "localhost";
   gchar *channel = NULL;
   gpointer key;
   gpointer value;
@@ -645,24 +599,6 @@ cockpit_channel_response_serve (CockpitWebService *service,
   if (!transport)
     goto out;
 
-  if (where)
-    {
-      /*
-       * Maybe send back a redirect to the checksum url. We only do this if actually
-       * accessing a file, and not a some sort of data like '/checksum', or a root path
-       * like '/'
-       */
-      if (where[0] == '@' && strchr (path, '.'))
-        {
-          checksum = cockpit_web_service_get_checksum (service, host);
-          if (checksum)
-            {
-              handled = redirect_to_checksum_path (service, response, checksum, path);
-              goto out;
-            }
-        }
-    }
-
   out_headers = cockpit_web_server_new_table ();
 
   channel = cockpit_web_service_unique_channel (service);
@@ -685,8 +621,7 @@ cockpit_channel_response_serve (CockpitWebService *service,
     {
       val = NULL;
 
-      if (g_ascii_strcasecmp (key, "Host") == 0 ||
-          g_ascii_strcasecmp (key, "Cookie") == 0 ||
+      if (g_ascii_strcasecmp (key, "Cookie") == 0 ||
           g_ascii_strcasecmp (key, "Referer") == 0 ||
           g_ascii_strcasecmp (key, "Connection") == 0 ||
           g_ascii_strcasecmp (key, "Pragma") == 0 ||
@@ -701,14 +636,28 @@ cockpit_channel_response_serve (CockpitWebService *service,
           g_ascii_strcasecmp (key, "TE") == 0 ||
           g_ascii_strcasecmp (key, "Trailer") == 0 ||
           g_ascii_strcasecmp (key, "Upgrade") == 0 ||
-          g_ascii_strcasecmp (key, "Transfer-Encoding") == 0)
+          g_ascii_strcasecmp (key, "Transfer-Encoding") == 0 ||
+          g_ascii_strcasecmp (key, "X-Forwarded-For") == 0 ||
+          g_ascii_strcasecmp (key, "X-Forwarded-Host") == 0 ||
+          g_ascii_strcasecmp (key, "X-Forwarded-Protocol") == 0)
         continue;
 
-      json_object_set_string_member (heads, key, value);
+      if (g_ascii_strcasecmp (key, "Host") == 0)
+        http_host = (gchar *) value;
+      else
+        json_object_set_string_member (heads, key, value);
+
       g_free (val);
     }
 
+  /* Send along the HTTP scheme the package should assume is accessing things */
+  connection = cockpit_web_response_get_stream (response);
+  protocol = cockpit_web_response_get_protocol (connection, in_headers);
+
   json_object_set_string_member (heads, "Host", host);
+  json_object_set_string_member (heads, "X-Forwarded-Proto", protocol);
+  json_object_set_string_member (heads, "X-Forwarded-Host", http_host);
+
   json_object_set_object_member (object, "headers", heads);
 
   chesp = cockpit_channel_response_create (service, response, transport,
@@ -742,10 +691,11 @@ cockpit_channel_response_open (CockpitWebService *service,
   WebSocketDataType data_type;
   GHashTable *headers;
   const gchar *content_type;
+  const gchar *content_encoding;
   const gchar *content_disposition;
 
   /* Parse the external */
-  if (!cockpit_web_service_parse_external (open, &content_type, &content_disposition, NULL))
+  if (!cockpit_web_service_parse_external (open, &content_type, &content_encoding, &content_disposition, NULL))
     {
       cockpit_web_response_error (response, 400, NULL, "Bad channel request");
       return;
@@ -776,6 +726,9 @@ cockpit_channel_response_open (CockpitWebService *service,
         content_type = "application/octet-stream";
     }
   g_hash_table_insert (headers, g_strdup ("Content-Type"), g_strdup (content_type));
+
+  if (content_encoding)
+    g_hash_table_insert (headers, g_strdup ("Content-Encoding"), g_strdup (content_encoding));
 
   /* We shouldn't need to send this part further */
   json_object_remove_member (open, "external");

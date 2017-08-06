@@ -9,5 +9,6 @@
         "path": "index.html",
         "order": 60
      }
-  }
+  },
+  "content-security-policy": "img-src 'self' data:; frame-src 'self' data:"
 }

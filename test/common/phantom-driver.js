@@ -44,8 +44,10 @@
 
 var page = require('webpage').create();
 var sys = require('system');
+var fs = require('fs');
 var clearedStorage = false;
-var messages = "";
+var messages = [];
+var currentCallMessageIndex = 0;
 var onCheckpoint;
 var waitTimeout;
 var didTimeout;
@@ -79,14 +81,17 @@ function inject_basics(loading) {
      */
     var injected = page.evaluate(function(canary, loading) {
         if (loading) {
+            /* A load is not complete until all resources are done */
+	    if (document.readyState !== "complete") {
+                document.addEventListener("readystatechange", function() {
+                    console.log("-*-CHECKPOINT-*-");
+                });
+		return null;
+            }
             if (typeof loading !== "string")
                 loading = window.location.href;
-            if (window.location.href !== loading || document.readyState === "loading") {
-                document.onreadystatechange = function() {
-                    console.log("-*-CHECKPOINT-*-");
-                };
+            if (window.location.href !== loading)
                 return null;
-            }
         }
         return canary in window;
     }, canary, loading || false);
@@ -182,9 +187,30 @@ var driver = {
 
     show: function(respond, file) {
         if (!file)
-            file = "page.png"
+            file = "page.png";
         page.render(file);
-        sys.stderr.writeLine("Wrote " + file)
+        sys.stderr.writeLine("Wrote " + file);
+        respond({ result: null });
+    },
+
+    dump: function(respond, file) {
+        if (!file)
+            file = "page.html";
+        var data = page.evaluate(function() {
+            return document.documentElement.outerHTML;
+	});
+        fs.write(file, data, 'w');
+        sys.stderr.writeLine("Wrote " + file);
+        respond({ result: null });
+    },
+
+    dump_log: function(respond, file) {
+        if (messages.length > 0) {
+            if (!file)
+                file = "page.js.log";
+            fs.write(file, messages.join('\n'), 'w');
+            sys.stderr.writeLine("Wrote " + file);
+        }
         respond({ result: null });
     },
 
@@ -347,7 +373,7 @@ function step() {
         if (responded)
             sys.stderr.writeLine("WARNING: " + line + " was true after timeout, add more checkpoints");
         else
-            respond({ error: "timeout" + messages });
+            respond({ error: "timeout\n" + messages.slice(currentCallMessageIndex).join('\n') });
     }, cmd.timeout || 60 * 1000);
 
     /* This function is called when functions want to respond */
@@ -361,7 +387,7 @@ function step() {
         window.clearTimeout(timeout);
         page.onError = null;
         timeout = null;
-        messages = "";
+        currentCallMessageIndex = messages.length;
         responded = true;
         onCheckpoint = null;
         loadFailure = null;
@@ -412,10 +438,7 @@ page.onResourceError = function(ex) {
      * Certain resource errors seem to be noise caused by
      * cancelled loads, and racy state in phantomjs
      */
-    if (ex.errorString === "Operation cancelled" ||
-        ex.errorString === "Operation canceled") {
-        prefix = "Ignoring Resource Error: ";
-    } else if (ex.errorString.indexOf("Network access is disabled") !== -1) {
+    if (ex.errorString.indexOf("Network access is disabled") !== -1) {
         sys.stderr.writeLine("ERROR: fatal problem: " + ex.errorString);
         phantom.exit(1);
         process.exit(1);
@@ -424,7 +447,7 @@ page.onResourceError = function(ex) {
     }
 
     sys.stderr.writeLine(prefix + ex.errorString + " " + ex.url);
-    messages += "\n" + ex.errorString + " " + ex.url;
+    messages.push(ex.errorString + " " + ex.url);
     checkpoint();
 };
 
@@ -438,7 +461,7 @@ page.onConsoleMessage = function(msg, lineNum, sourceId) {
         // sys.stderr.writeLine("CHECKPOINT");
         checkpoint();
     } else {
-        messages += "\n" + msg;
+        messages.push(msg);
         sys.stderr.writeLine('> ' + msg);
     }
 };

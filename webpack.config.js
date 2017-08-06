@@ -34,6 +34,10 @@ var info = {
             "machines/machines.less",
         ],
 
+        "machines/vnc": [
+            "machines/vnc.js",
+        ],
+
         "networkmanager/network": [
             "networkmanager/interfaces.js",
             "networkmanager/utils.js"
@@ -49,6 +53,9 @@ var info = {
         ],
         "playground/metrics": [
             "playground/metrics.js",
+        ],
+        "playground/pkgs": [
+            "playground/pkgs.js",
         ],
         "playground/plot": [
             "playground/plot.js",
@@ -115,10 +122,16 @@ var info = {
         ],
         "systemd/terminal": [
             "systemd/terminal.jsx",
+            "systemd/terminal.css",
         ],
 
         "tuned/performance": [
             "tuned/dialog.js",
+        ],
+
+        "packagekit/updates": [
+            "packagekit/updates.jsx",
+            "packagekit/updates.css",
         ],
 
         "users/users": [
@@ -174,6 +187,8 @@ var info = {
 
         "machines/index.html",
         "machines/manifest.json",
+        "machines/vnc.html",
+        "machines/vnc.css",
 
         "networkmanager/index.html",
         "networkmanager/manifest.json",
@@ -181,10 +196,14 @@ var info = {
         "ostree/manifest.json",
         "ostree/index.html",
 
+        "packagekit/index.html",
+        "packagekit/manifest.json",
+
         "playground/hammer.gif",
         "playground/manifest.json",
         "playground/jquery-patterns.html",
         "playground/metrics.html",
+        "playground/pkgs.html",
         "playground/plot.html",
         "playground/po.js",
         "playground/react-patterns.html",
@@ -257,7 +276,7 @@ var srcdir = process.env.SRCDIR || __dirname;
 var builddir = process.env.BUILDDIR || __dirname;
 var distdir = builddir + path.sep + "dist";
 var libdir = path.resolve(srcdir, "pkg" + path.sep + "lib");
-var bowerdir = path.resolve(srcdir, "bower_components");
+var nodedir = path.resolve(srcdir, "node_modules");
 var section = process.env.ONLYDIR || null;
 
 /* A standard nodejs and webpack pattern */
@@ -310,11 +329,13 @@ info.files = files;
 
 var plugins = [
     new webpack.DefinePlugin({
-        'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')
+        'process.env': {
+            'NODE_ENV': JSON.stringify(production ? 'production' : 'development')
+        }
     }),
     new copy(info.files),
     new extract("[name].css")
-    ];
+];
 
 var output = {
     path: distdir,
@@ -357,7 +378,7 @@ if (!section || section.indexOf("base1") === 0) {
         from: srcdir + path.sep + "src/base1/cockpit.js",
         to: "base1/cockpit.js"
     }, {
-        from: bowerdir + path.sep + "jquery/dist/jquery.js",
+        from: nodedir + path.sep + "jquery/dist/jquery.js",
         to: "base1/jquery.js"
     }, {
         from: srcdir + path.sep + "po/po.js",
@@ -365,20 +386,26 @@ if (!section || section.indexOf("base1") === 0) {
     });
 }
 
+var aliases = {
+    "angular": "angular/angular.js",
+    "angular-route": "angular-route/angular-route.js",
+    "d3": "d3/d3.js",
+    "moment": "moment/moment.js",
+    "react": "react-lite/dist/react-lite.js",
+    "term": "term.js-cockpit/src/term.js",
+};
+
+/* HACK: To get around redux warning about reminimizing code */
+if (production)
+    aliases["redux/dist/redux"] = "redux/dist/redux.min.js";
+
 module.exports = {
     resolve: {
-        alias: {
-            "angular": "angular/angular.js",
-            "angular-route": "angular-route/angular-route.js",
-            "d3": "d3/d3.js",
-            "moment": "momentjs/moment.js",
-            "react": "react-lite-cockpit/dist/react-lite.js",
-            "term": "term.js-cockpit/src/term.js",
-        },
-        modulesDirectories: [ libdir, bowerdir ]
+        alias: aliases,
+        modulesDirectories: [ libdir, nodedir ]
     },
     resolveLoader: {
-        root: path.resolve(srcdir, 'node_modules')
+        root: nodedir
     },
     entry: info.entries,
     output: output,
@@ -391,7 +418,7 @@ module.exports = {
         preLoaders: [
             {
                 test: /\.js$/, // include .js files
-                exclude: /bower_components\/.*\/|\/node_modules/, // exclude external dependencies
+                exclude: /\/node_modules\/.*\//, // exclude external dependencies
                 loader: "jshint-loader"
             },
             {
@@ -400,14 +427,14 @@ module.exports = {
             },
             {
                 test: /\.jsx$/,
-                exclude: /bower_components\/.*\/|\/node_modules/, // exclude external dependencies
+                exclude: /\/node_modules\/.*\//, // exclude external dependencies
                 loader: "eslint-loader"
             }
         ],
         loaders: [
             {
                 test: /\.js$/,
-                exclude: /bower_components\/.*\/|\/node_modules/,
+                exclude: /\/node_modules\/.*\//, // exclude external dependencies
                 loader: 'strict' // Adds "use strict"
             },
             {
@@ -434,6 +461,11 @@ module.exports = {
                 test: /[\/]angular\.js$/,
                 loader: "exports?angular"
             }
+        ],
+
+        /* The stuff in noVNC are plain ol javascript */
+        noParse: [
+            /\/node_modules\/noVNC\//
         ]
     },
 

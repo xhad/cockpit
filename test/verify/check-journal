@@ -22,10 +22,6 @@ import parent
 from testlib import *
 
 class TestJournal(MachineCase):
-    def setUp(self):
-        # we need a static ip for this test
-        MachineCase.setUp(self, macaddr='52:54:00:9e:00:F4')
-
     def testBasic(self):
         b = self.browser
         b.wait_timeout(120)
@@ -97,7 +93,7 @@ ExecStart=/bin/sh -c 'for s in $(seq 10); do echo SLOW; sleep 0.1; done; sleep 1
         m.execute("! systemctl --quiet is-active ntp || (systemctl disable ntp && systemctl stop ntp)")
         m.execute("! systemctl --quiet is-active chronyd || (systemctl disable chronyd && systemctl stop chronyd)")
 
-        m.execute("timedatectl set-ntp off; timedatectl set-time 2050-01-01")
+        m.execute("timedatectl set-ntp off; timedatectl set-time 2038-01-01")
 
         self.login_and_go("/system/logs")
         inject_extras()
@@ -122,8 +118,8 @@ ExecStart=/bin/sh -c 'for s in $(seq 10); do echo SLOW; sleep 0.1; done; sleep 1
                 return month_names[d.getMonth()] + ' ' + d.getDate().toFixed() + ', ' + d.getFullYear().toFixed();
             }
         """)
-        # January 1, 2050 00:00:00Z in browser time
-        expected_date = b.eval_js("localTime(2524608000000)")
+        # January 1, 2038 00:00:00Z in browser time
+        expected_date = b.eval_js("localTime(2145916800000)")
 
         def wait_log_lines(expected):
             b.wait_js_func("""(function (expected) {
@@ -210,10 +206,6 @@ ExecStart=/bin/sh -c 'for s in $(seq 10); do echo SLOW; sleep 0.1; done; sleep 1
         wait_journal_empty()
         b.go("#/?prio=*&start=oldest&service=slow10.service")
         wait_slow10()
-
-        # Debian 8 doesn't have persistent journal logging across boots
-        if m.image in [ "debian-8" ]:
-            return
 
         # insert messages as errors because we know these will be shown by default
         m.execute("systemctl start systemd-journald.service")
@@ -302,6 +294,136 @@ s.send("PRIORITY=3\\nFOO=bar\\n")'
         b.click(sel)
 
         b.wait_text("#journal-entry-message", "[no data]")
+
+    @skipImage("Newer version of ABRT required", "centos-7", "rhel-7", "fedora-25", "fedora-i386", "fedora-testing", "rhel-7-4")
+    @skipImage("ABRT not available", "debian-stable", "debian-testing", "ubuntu-stable", "ubuntu-1604", "rhel-atomic", "fedora-atomic", "continuous-atomic")
+    def testAbrtSegv(self):
+        b = self.browser
+        m = self.machine
+
+        self.login_and_go("/system/logs")
+
+        m.execute("setenforce 0; ulimit -c unlimited; python -c 'import os; os.kill(os.getpid(), 11)' || true")
+
+        sel = "#journal-box .cockpit-logline .cockpit-log-message:contains('crashed in posix_kill')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        def wait_field(name, value):
+            row_sel = "#journal-entry-fields tr:contains('" + name + "')"
+            b.wait_present(row_sel + " td:nth-child(2):contains('" + value + "')")
+
+        wait_field("SYSLOG_IDENTIFIER", "abrt-notification")
+
+        b.click("li:contains(Problem info)")
+        wait_field("crash_function", "posix_kill")
+
+        b.click("li:contains(Problem details)")
+        sel = "#journal-entry-fields #accordion-markup .panel .panel-heading"
+        sel += " .panel-title .accordion-toggle:contains('core_backtrace')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        sel = "#journal-entry #accordion-markup .panel .panel-collapse"
+        sel += " .panel-body:contains('signal: 11  executable: ')"
+        b.wait_present(sel)
+
+    @skipImage("Newer version of ABRT required", "centos-7", "rhel-7", "fedora-25", "fedora-i386", "fedora-testing", "rhel-7-4")
+    @skipImage("ABRT not available", "debian-stable", "debian-testing", "ubuntu-stable", "ubuntu-1604", "rhel-atomic", "fedora-atomic", "continuous-atomic")
+    def testAbrtDelete(self):
+        b = self.browser
+        m = self.machine
+
+        self.login_and_go("/system/logs")
+
+        m.execute("setenforce 0; ulimit -c unlimited; echo 'sleep 42m &' > slp; chmod u+x slp")
+        m.execute("./slp; pkill -SEGV sleep")
+
+        sel = "#journal-box .cockpit-logline .cockpit-log-message:contains('crashed in __nanosleep()')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        sel = "#journal-entry-fields .nav .btn-danger"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        b.wait_visible("#journal-box")
+        b.wait_in_text('#journal-box', "__nanosleep")
+
+        sel = "#journal-box .cockpit-logline .cockpit-log-message:contains('crashed in __nanosleep()')"
+        b.click(sel)
+
+        b.wait_present('.cockpit-log-panel')
+        b.wait_visible('.cockpit-log-panel')
+
+        sel = "#journal-entry .panel #journal-entry-message:contains('crashed in __nanosleep()')"
+        b.wait_present(sel)
+
+    @skipImage("Newer version of ABRT required", "centos-7", "rhel-7", "fedora-25", "fedora-i386", "fedora-testing", "rhel-7-4")
+    @skipImage("ABRT not available", "debian-stable", "debian-testing", "ubuntu-stable", "ubuntu-1604", "rhel-atomic", "fedora-atomic", "continuous-atomic")
+    def testAbrtReport(self):
+        # The testing server is located at verify/files/mock-faf-server.py
+        # Adjust Handler.known for for the expected succession of known/unknown problems
+        b = self.browser
+        m = self.machine
+
+        # start mock FAF server
+        m.upload(["verify/files/mock-faf-server.py"], "/tmp/")
+        m.execute("setsid python /tmp/mock-faf-server.py >/tmp/mock-faf.log 2>&1 &")
+        m.execute("echo 'URL=http://localhost:12345' >> /etc/libreport/plugins/ureport.conf")
+
+        self.login_and_go("/system/logs")
+
+        m.execute("setenforce 0; ulimit -c unlimited; echo 'sleep 42m &' > slp; chmod u+x slp")
+        m.execute("./slp; pkill -SEGV sleep")
+
+        sel = "#journal-box .cockpit-logline .cockpit-log-message:contains('crashed in __nanosleep()')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        # Wait until loaded (when delete button is loaded, all is loaded)
+        sel = "#journal-entry-fields .nav .btn-danger"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+
+        sel = "#journal-entry-fields .nav .btn-primary:contains('Report')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        sel = "#journal-entry-fields .nav .problem-btn:contains('Reported')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        self.assertIn("/reports/bthash/123deadbeef", b.attr(sel, 'href'))
+
+        # "Unreport" the problem to test reporting unknown problem
+        m.execute('find /var/spool/abrt -name "reported_to" | xargs rm')
+
+        b.reload()
+        b.enter_page("/system/logs")
+
+        sel = "#journal-entry-fields"
+        b.wait_present(sel)
+
+        self.allow_journal_messages('.*This problem has already been reported.')
+        self.allow_journal_messages('.*http://localhost:12345/reports/42/')
+        self.allow_journal_messages('.*https://bugzilla.example.com/show_bug.cgi\?id=123456')
+
+        sel = "#journal-entry-fields .nav .btn-primary:contains('Report')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        b.click(sel)
+
+        sel = "#journal-entry-fields .nav .problem-btn:contains('Reported')"
+        b.wait_present(sel)
+        b.wait_visible(sel)
+        self.assertIn("/reports/bthash/123deadbeef", b.attr(sel, 'href'))
+
 
 if __name__ == '__main__':
     test_main()

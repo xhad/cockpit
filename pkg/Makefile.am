@@ -18,6 +18,7 @@ EXTRA_DIST += \
 	pkg/playground/extra.de.po \
 	pkg/users/mock \
 	pkg/lib/qunit-template.html \
+	node_modules/noVNC/package.json \
 	$(playground_DATA) \
 	$(pkg_TESTS)
 

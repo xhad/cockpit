@@ -24,9 +24,9 @@
     var angular = require('angular');
     require('angular-route');
     require('angular-gettext/dist/angular-gettext.js');
-    require('angular-bootstrap/ui-bootstrap.js');
-    require('kubernetes-object-describer/dist/object-describer.js');
+    require('angular-bootstrap-npm/dist/angular-bootstrap.js');
     require('kubernetes-container-terminal/dist/container-terminal.js');
+    require('kubernetes-object-describer/dist/object-describer.js');
 
     /* The kubernetes client */
     require('./kube-client');
@@ -61,9 +61,11 @@
         'kubernetes.topology',
         'kubernetes.volumes',
         'kubernetes.nodes',
+        'kubernetes.date',
         'registry.images',
         'registry.policy',
         'registry.projects',
+        'registryUI.date',
         'kubernetesUI'
     ])
 
@@ -77,11 +79,12 @@
         'kubernetesContainerSocketProvider',
         'KubeDiscoverSettingsProvider',
         'KubeBrowserStorageProvider',
+        'MomentLibProvider',
         '$provide',
         function($routeProvider, KubeWatchProvider, KubeRequestProvider,
                  KubeSocketProvider, KubeTranslateProvider, KubeFormatProvider,
                  kubernetesContainerSocketProvider, KubeDiscoverSettingsProvider,
-                 KubeBrowserStorageProvider, $provide) {
+                 KubeBrowserStorageProvider, MomentLibProvider, $provide) {
 
             $routeProvider.otherwise({ redirectTo: '/' });
 
@@ -93,6 +96,7 @@
             KubeFormatProvider.KubeFormatFactory = "CockpitFormat";
             KubeDiscoverSettingsProvider.KubeDiscoverSettingsFactory = "cockpitKubeDiscoverSettings";
             KubeBrowserStorageProvider.KubeBrowserStorageFactory = "cockpitBrowserStorage";
+            MomentLibProvider.MomentLibFactory = "momentLib";
 
             /* Tell the container-terminal that we want to be involved in WebSocket creation */
             kubernetesContainerSocketProvider.WebSocketFactory = 'cockpitContainerWebSocket';

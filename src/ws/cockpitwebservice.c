@@ -21,22 +21,24 @@
 
 #include "cockpitwebservice.h"
 
+#include "cockpitcompat.h"
+#include "cockpitws.h"
+
 #include <string.h>
 
 #include <json-glib/json-glib.h>
 #include <gio/gunixinputstream.h>
 #include <gio/gunixoutputstream.h>
 
+#include "common/cockpitauthorize.h"
 #include "common/cockpitconf.h"
+#include "common/cockpithex.h"
 #include "common/cockpitjson.h"
 #include "common/cockpitlog.h"
 #include "common/cockpitmemory.h"
 #include "common/cockpitsystem.h"
 #include "common/cockpitwebresponse.h"
 #include "common/cockpitwebserver.h"
-
-#include "cockpitws.h"
-#include "reauthorize.h"
 
 #include "websocket/websocket.h"
 
@@ -381,6 +383,13 @@ send_socket_hints (CockpitWebService *self,
   g_bytes_unref (payload);
 }
 
+static void
+clear_and_free_string (gpointer data)
+{
+  cockpit_memory_clear (data, -1);
+  free (data);
+}
+
 static gboolean
 process_socket_authorize (CockpitWebService *self,
                           CockpitSocket *socket,
@@ -388,62 +397,107 @@ process_socket_authorize (CockpitWebService *self,
                           JsonObject *options,
                           GBytes *payload)
 {
-  const gchar *credential = NULL;
-  const gchar *string = NULL;
-  GBytes *password;
+  const gchar *response = NULL;
+  gboolean ret = FALSE;
+  GBytes *bytes = NULL;
+  char *password = NULL;
+  char *user = NULL;
+  char *type = NULL;
   gpointer data;
   gsize length;
 
-  if (!cockpit_json_get_string (options, "credential", NULL, &credential))
+  if (!cockpit_json_get_string (options, "response", NULL, &response))
     {
-      g_warning ("%s: received invalid \"credential\" field in authorize command", socket->id);
-      return FALSE;
+      g_warning ("%s: received invalid \"response\" field in authorize command", socket->id);
+      goto out;
     }
-  else if (!credential)
-    {
-      password = cockpit_creds_get_password (self->creds);
-      send_socket_hints (self, "credential", password ? "password" : "none");
-      if (self->credential_requests)
-        send_socket_hints (self, "credential", "request");
-    }
-  else if (g_str_equal (credential, "password"))
-    {
-      if (!cockpit_json_get_string (options, "password", NULL, &string))
-        {
-          g_warning ("%s: received invalid \"password\" field in \"authorize\" command", socket->id);
-          return FALSE;
-        }
 
-      if (string == NULL)
+  ret = TRUE;
+  if (response)
+    {
+      if (!cockpit_authorize_type (response, &type) || !g_str_equal (type, "basic"))
+        goto out;
+
+      password = cockpit_authorize_parse_basic (response, &user);
+      if (password && !user)
         {
-          send_socket_hints (self, "credential", "none");
-          self->credential_requests = 0;
+          cockpit_memory_clear (password, -1);
+          free (password);
           password = NULL;
-        }
-      else
-        {
-          send_socket_hints (self, "credential", "password");
-          password = g_bytes_new_with_free_func (string, strlen (string),
-                                                 (GDestroyNotify)json_object_unref,
-                                                 json_object_ref (options));
-        }
-
-      cockpit_creds_set_password (self->creds, password);
-
-      /* Clear out the payload memory */
-      if (password)
-        {
-          data = (gpointer)g_bytes_get_data (payload, &length);
-          cockpit_secclear (data, length);
-          g_bytes_unref (password);
         }
     }
   else
     {
-      g_message ("%s: unsupported authorize command credential: %s", socket->id, credential);
+      send_socket_hints (self, "credential",
+                         cockpit_creds_get_password (self->creds) ? "password" : "none");
+      if (self->credential_requests)
+        send_socket_hints (self, "credential", "request");
+      goto out;
     }
 
-  return TRUE;
+  if (password == NULL)
+    {
+      send_socket_hints (self, "credential", "none");
+      self->credential_requests = 0;
+      bytes = NULL;
+    }
+  else
+    {
+      send_socket_hints (self, "credential", "password");
+      bytes = g_bytes_new_with_free_func (password, strlen (password),
+                                          clear_and_free_string, password);
+      password = NULL;
+    }
+
+  cockpit_creds_set_user (self->creds, user);
+  cockpit_creds_set_password (self->creds, bytes);
+
+  /* Clear out the payload memory */
+  data = (gpointer)g_bytes_get_data (payload, &length);
+  cockpit_memory_clear (data, length);
+
+out:
+  free (type);
+  free (user);
+  if (bytes)
+    g_bytes_unref (bytes);
+  return ret;
+}
+
+static gboolean
+authorize_check_user (CockpitCreds *creds,
+                      const char *challenge)
+{
+  char *subject = NULL;
+  gboolean ret = FALSE;
+  gchar *encoded = NULL;
+  const gchar *user;
+
+  if (!cockpit_authorize_subject (challenge, &subject))
+    goto out;
+
+  if (!subject || g_str_equal (subject, ""))
+    {
+      ret = TRUE;
+    }
+  else
+    {
+      user = cockpit_creds_get_user (creds);
+      if (user == NULL)
+        {
+          ret = TRUE;
+        }
+      else
+        {
+          encoded = cockpit_hex_encode (user, -1);
+          ret = g_str_equal (encoded, subject);
+        }
+    }
+
+out:
+  g_free (encoded);
+  free (subject);
+  return ret;
 }
 
 static gboolean
@@ -453,7 +507,6 @@ process_transport_authorize (CockpitWebService *self,
 {
   const gchar *cookie = NULL;
   GBytes *payload;
-  char *user = NULL;
   char *type = NULL;
   char *alloc = NULL;
   const char *response = NULL;
@@ -461,7 +514,6 @@ process_transport_authorize (CockpitWebService *self,
   const gchar *password;
   const gchar *host;
   GBytes *data;
-  int rc;
 
   if (!cockpit_json_get_string (options, "challenge", NULL, &challenge) ||
       !cockpit_json_get_string (options, "cookie", NULL, &cookie) ||
@@ -474,62 +526,67 @@ process_transport_authorize (CockpitWebService *self,
   if (!challenge || !cookie)
     {
       g_message ("unsupported or unknown authorize command");
+      return FALSE;
     }
-  else if (reauthorize_type (challenge, &type) < 0 ||
-           reauthorize_user (challenge, &user) < 0)
+
+  if (!cockpit_authorize_type (challenge, &type))
     {
       g_message ("received invalid authorize challenge command");
     }
-  else if (!g_str_equal (cockpit_creds_get_user (self->creds), user))
-    {
-      g_message ("received authorize command for wrong user: %s", user);
-    }
-  else if (g_str_equal (type, "plain1"))
+  else if (g_str_equal (type, "plain1") ||
+           g_str_equal (type, "crypt1") ||
+           g_str_equal (type, "basic"))
     {
       data = cockpit_creds_get_password (self->creds);
       if (!data)
         {
-          g_debug ("%s: received authorize crypt1 challenge, but no password to reauthenticate", host);
+          g_debug ("%s: received \"authorize\" %s \"challenge\", but no password", host, type);
         }
-      else
+      else if (!g_str_equal ("basic", type) && !authorize_check_user (self->creds, challenge))
         {
-          response = g_bytes_get_data (data, NULL);
-        }
-    }
-  else if (g_str_equal (type, "crypt1"))
-    {
-      data = cockpit_creds_get_password (self->creds);
-      if (!data)
-        {
-          g_debug ("received authorize crypt1 challenge, but no password to reauthenticate");
+          g_debug ("received \"authorize\" %s \"challenge\", but for wrong user", type);
         }
       else
         {
           password = g_bytes_get_data (data, NULL);
-          rc = reauthorize_crypt1 (challenge, password, &alloc);
-          if (rc < 0)
-            g_message ("failed to reauthorize crypt1 challenge");
+          if (g_str_equal (type, "crypt1"))
+            {
+              alloc = cockpit_compat_reply_crypt1 (challenge, password);
+              if (alloc)
+                response = alloc;
+              else
+                g_message ("failed to \"authorize\" crypt1 \"challenge\"");
+            }
+          else if (g_str_equal (type, "basic"))
+            {
+              response = cockpit_authorize_build_basic (cockpit_creds_get_user (self->creds),
+                                                        password);
+            }
           else
-            response = alloc;
+            {
+              response = password;
+            }
         }
     }
 
   /* Tell the frontend that we're reauthorizing */
-  self->credential_requests++;
-  send_socket_hints (self, "credential", "request");
+  if (self->init_received)
+    {
+      self->credential_requests++;
+      send_socket_hints (self, "credential", "request");
+    }
 
-  if (!self->sent_done)
+  if (cookie && !self->sent_done)
     {
       payload = cockpit_transport_build_control ("command", "authorize",
                                                  "cookie", cookie,
                                                  "response", response ? response : "",
-                                                 "host", host ? host : "localhost",
+                                                 "host", host,
                                                  NULL);
       cockpit_transport_send (transport, NULL, payload);
       g_bytes_unref (payload);
     }
 
-  free (user);
   free (type);
   free (alloc);
   return TRUE;
@@ -540,6 +597,8 @@ process_transport_init (CockpitWebService *self,
                         CockpitTransport *transport,
                         JsonObject *options)
 {
+  JsonObject *object;
+  GBytes *payload;
   gint64 version;
 
   if (!cockpit_json_get_int (options, "version", -1, &version))
@@ -555,6 +614,15 @@ process_transport_init (CockpitWebService *self,
       g_object_set_data_full (G_OBJECT (transport), "init",
                               json_object_ref (options),
                               (GDestroyNotify) json_object_unref);
+
+      /* Always send an init message down the new transport */
+      object = cockpit_transport_build_json ("command", "init", NULL);
+      json_object_set_int_member (object, "version", 1);
+      json_object_set_string_member (object, "host", "localhost");
+      payload = cockpit_json_write_bytes (object);
+      json_object_unref (object);
+      cockpit_transport_send (transport, NULL, payload);
+      g_bytes_unref (payload);
     }
   else
     {
@@ -710,6 +778,7 @@ cockpit_web_service_parse_binary (JsonObject *options,
 gboolean
 cockpit_web_service_parse_external (JsonObject *options,
                                     const gchar **content_type,
+                                    const gchar **content_encoding,
                                     const gchar **content_disposition,
                                     gchar ***protocols)
 {
@@ -737,6 +806,8 @@ cockpit_web_service_parse_external (JsonObject *options,
         *content_disposition = NULL;
       if (content_type)
         *content_type = NULL;
+      if (content_encoding)
+        *content_encoding = NULL;
       if (protocols)
         *protocols = NULL;
       return TRUE;
@@ -767,6 +838,15 @@ cockpit_web_service_parse_external (JsonObject *options,
     }
   if (content_type)
     *content_type = value;
+
+  if (!cockpit_json_get_string (external, "content-encoding", NULL, &value) ||
+      (value && !cockpit_web_response_is_header_value (value)))
+    {
+      g_message ("invalid \"content-encoding\" external option");
+      return FALSE;
+    }
+  if (content_encoding)
+    *content_encoding = value;
 
   if (!cockpit_json_get_strv (external, "protocols", NULL, protocols))
     {
@@ -832,15 +912,12 @@ process_logout (CockpitWebService *self,
   /* Destroys our web service, disconnects everything */
   if (disconnect)
     {
-      g_info ("Logging out user %s from %s",
-              cockpit_creds_get_user (self->creds),
-              cockpit_creds_get_rhost (self->creds));
+      g_info ("Logging out session from %s", cockpit_creds_get_rhost (self->creds));
       g_object_run_dispose (G_OBJECT (self));
     }
   else
     {
-      g_info ("Deauthorizing user %s",
-              cockpit_creds_get_rhost (self->creds));
+      g_info ("Deauthorizing session from %s", cockpit_creds_get_rhost (self->creds));
     }
 
   send_socket_hints (self, "credential", "none");
@@ -1016,9 +1093,7 @@ on_web_socket_open (WebSocketConnection *connection,
   JsonObject *object;
   JsonObject *info;
 
-  g_info ("New connection from %s for %s",
-          cockpit_creds_get_rhost (self->creds),
-          cockpit_creds_get_user (self->creds));
+  g_info ("New connection to session from %s", cockpit_creds_get_rhost (self->creds));
 
   socket = cockpit_socket_lookup_by_connection (&self->sockets, connection);
   g_return_if_fail (socket != NULL);
@@ -1103,9 +1178,7 @@ on_web_socket_close (WebSocketConnection *connection,
 {
   CockpitSocket *socket;
 
-  g_info ("WebSocket from %s for %s closed",
-          cockpit_creds_get_rhost (self->creds),
-          cockpit_creds_get_user (self->creds));
+  g_info ("WebSocket from %s for session closed", cockpit_creds_get_rhost (self->creds));
 
   g_signal_handlers_disconnect_by_func (connection, on_web_socket_open, self);
   g_signal_handlers_disconnect_by_func (connection, on_web_socket_closing, self);
@@ -1160,6 +1233,7 @@ cockpit_web_service_class_init (CockpitWebServiceClass *klass)
   sig_idling = g_signal_new ("idling", COCKPIT_TYPE_WEB_SERVICE,
                              G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
                              G_TYPE_NONE, 0);
+
   sig_destroy = g_signal_new ("destroy", COCKPIT_TYPE_WEB_SERVICE,
                               G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
                               G_TYPE_NONE, 0);
@@ -1185,8 +1259,6 @@ cockpit_web_service_new (CockpitCreds *creds,
                          CockpitTransport *transport)
 {
   CockpitWebService *self;
-  JsonObject *object;
-  GBytes *command;
 
   g_return_val_if_fail (creds != NULL, NULL);
   g_return_val_if_fail (transport != NULL, NULL);
@@ -1198,16 +1270,6 @@ cockpit_web_service_new (CockpitCreds *creds,
   self->control_sig = g_signal_connect_after (self->transport, "control", G_CALLBACK (on_transport_control), self);
   self->recv_sig = g_signal_connect_after (self->transport, "recv", G_CALLBACK (on_transport_recv), self);
   self->closed_sig = g_signal_connect_after (self->transport, "closed", G_CALLBACK (on_transport_closed), self);
-
-  /* Always send an init message down the new transport */
-  object = cockpit_transport_build_json ("command", "init", NULL);
-  json_object_set_int_member (object, "version", 1);
-  json_object_set_string_member (object, "host", "localhost");
-  command = cockpit_json_write_bytes (object);
-  json_object_unref (object);
-
-  cockpit_transport_send (transport, NULL, command);
-  g_bytes_unref (command);
 
   return self;
 }
@@ -1223,7 +1285,6 @@ cockpit_web_service_create_socket (const gchar **protocols,
   const gchar *host = NULL;
   const gchar *protocol = NULL;
   const gchar **origins;
-  const gchar *protocol_header;
   gchar *allocated = NULL;
   gchar *origin = NULL;
   gchar *defaults[2];
@@ -1237,21 +1298,18 @@ cockpit_web_service_create_socket (const gchar **protocols,
   if (!host)
     host = cockpit_ws_default_host_header;
 
-  secure = G_IS_TLS_CONNECTION (io_stream);
-
-  /* Check for a proxy header to see if we were on a TLS connection */
-  if (!secure)
+  /* No headers case for tests */
+  if (cockpit_ws_default_protocol_header && !headers &&
+      cockpit_conf_string ("WebService", "ProtocolHeader"))
     {
-      protocol_header = cockpit_conf_string ("WebService", "ProtocolHeader");
-      if (protocol_header && headers)
-        protocol = g_hash_table_lookup (headers, protocol_header);
-
-      /* No headers case for tests */
-      if (protocol_header && !headers)
-        protocol = cockpit_ws_default_protocol_header;
-
-      secure = g_strcmp0 (protocol, "https") == 0;
+      protocol = cockpit_ws_default_protocol_header;
     }
+  else
+    {
+      protocol = cockpit_web_response_get_protocol (io_stream, headers);
+    }
+
+  secure = g_strcmp0 (protocol, "https") == 0;
 
   url = g_strdup_printf ("%s://%s%s",
                          secure ? "wss" : "ws",
@@ -1423,12 +1481,17 @@ cockpit_web_service_set_host_checksum (CockpitWebService *self,
                                        const gchar *checksum)
 {
   const gchar *old_checksum = g_hash_table_lookup (self->checksum_by_host, host);
+  const gchar *old_host = g_hash_table_lookup (self->host_by_checksum, checksum);
+
   if (g_strcmp0 (checksum, old_checksum) == 0)
     return;
 
   if (old_checksum)
     g_hash_table_remove (self->host_by_checksum, old_checksum);
 
-  g_hash_table_replace (self->host_by_checksum, g_strdup (checksum), g_strdup (host));
+  /* Only replace checksum if the old one wasn't localhost */
+  if (g_strcmp0 (old_host, "localhost") != 0)
+    g_hash_table_replace (self->host_by_checksum, g_strdup (checksum), g_strdup (host));
+
   g_hash_table_replace (self->checksum_by_host, g_strdup (host), g_strdup (checksum));
 }

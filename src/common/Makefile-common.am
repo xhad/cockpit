@@ -35,7 +35,13 @@ EXTRA_DIST += \
 noinst_LIBRARIES += libcockpit-common.a
 
 libcockpit_common_a_SOURCES = \
+	src/common/cockpitauthorize.c \
+	src/common/cockpitauthorize.h \
+	src/common/cockpitbase64.c \
+	src/common/cockpitbase64.h \
 	src/common/cockpiterror.h src/common/cockpiterror.c \
+	src/common/cockpitframe.c \
+	src/common/cockpitframe.h \
 	src/common/cockpithash.c \
 	src/common/cockpithash.h \
 	src/common/cockpithex.c \
@@ -120,8 +126,29 @@ COCKPIT_CHECKS = \
 	test-unicode \
 	test-version \
 	test-system \
+	test-base64 \
+	test-authorize \
 	$(NULL)
 
+test_authorize_CFLAGS = $(libcockpit_common_a_CFLAGS)
+test_authorize_SOURCES = \
+	src/common/cockpitauthorize.c \
+	src/common/cockpitauthorize.h \
+	src/common/cockpitbase64.c \
+	src/common/cockpitbase64.h \
+	src/common/cockpitmemory.c \
+	src/common/cockpitmemory.h \
+	src/common/test-authorize.c \
+	$(NULL)
+test_authorize_LDADD = libretest.a
+
+test_base64_CFLAGS = $(COCKPIT_SESSION_CFLAGS)
+test_base64_SOURCES = \
+	src/common/test-base64.c \
+	src/common/cockpitbase64.h \
+	src/common/cockpitbase64.c \
+	$(NULL)
+test_base64_LDADD = libretest.a
 
 test_hash_CFLAGS = $(libcockpit_common_a_CFLAGS)
 test_hash_SOURCES = src/common/test-hash.c
@@ -129,7 +156,7 @@ test_hash_LDADD = $(libcockpit_common_a_LIBS)
 
 test_hex_CFLAGS = $(libcockpit_common_a_CFLAGS)
 test_hex_SOURCES = src/common/test-hex.c
-test_hex_LDADD = $(libcockpit_common_a_LIBS)
+test_hex_LDADD = libretest.a $(libcockpit_common_a_LIBS)
 
 test_json_CFLAGS = $(libcockpit_common_a_CFLAGS)
 test_json_SOURCES = src/common/test-json.c

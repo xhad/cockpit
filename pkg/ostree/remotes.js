@@ -40,24 +40,30 @@ angular.module('ostree.remotes', [
             return cockpit.spawn(["ostree", "remote", "list"],
                                  { "superuser" : "try", "err" : "message"}).
                 then(function(data) {
-                    var d = data.trim().split(/\r\n|\r|\n/);
+                    var d = [];
+                    angular.forEach(data.trim().split(/\r\n|\r|\n/), function (v, k) {
+                        if (v)
+                            d.push(v);
+                    });
                     return d.sort();
                 });
         }
 
         function listBranches(remote) {
-            return cockpit.spawn(["ostree", "remote", "refs", remote],
-                                 { "superuser" : "try", "err" : "message"}).
-                then(function(data) {
-                    var d = [];
-                    angular.forEach(data.trim().split(/\r\n|\r|\n/), function (v, k) {
-                        var parts = v.split(":");
-                        if (parts.length > 1)
-                            d.push(parts.slice(1).join(":"));
-                        else
-                            d.push(v);
+            return client.reload().then(function () {
+                return cockpit.spawn(["ostree", "remote", "refs", remote],
+                                     { "superuser" : "try", "err" : "message"}).
+                    then(function(data) {
+                        var d = [];
+                        angular.forEach(data.trim().split(/\r\n|\r|\n/), function (v, k) {
+                            var parts = v.split(":");
+                            if (parts.length > 1)
+                                d.push(parts.slice(1).join(":"));
+                            else if (v)
+                                d.push(v);
+                        });
+                        return d.sort();
                     });
-                    return d.sort();
                 });
         }
 

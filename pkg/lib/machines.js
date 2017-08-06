@@ -51,7 +51,7 @@
 
         function storage(ev) {
             if (ev.key === key && ev.storageArea === window.sessionStorage)
-                refresh(JSON.parse(ev.newValue));
+                refresh(JSON.parse(ev.newValue || "null"));
         }
 
         window.addEventListener("storage", storage);
@@ -172,11 +172,16 @@
         }
 
         function update_saved_machine(host, values) {
-            // wrap values in variants for D-Bus call
+            // wrap values in variants for D-Bus call; at least values.port can
+            // be int or string, so stringify everything but the "visible" boolean
             var values_variant = {};
             for (var prop in values)
-                if (values[prop] !== null)
-                    values_variant[prop] = cockpit.variant(prop == "visible" ? 'b' : 's', values[prop]);
+                if (values[prop] !== null) {
+                    if (prop == "visible")
+                        values_variant[prop] = cockpit.variant('b', values[prop]);
+                    else
+                        values_variant[prop] = cockpit.variant('s', values[prop].toString());
+                }
 
             // FIXME: investigate re-using the proxy from Loader (runs in different frame/scope)
             var bridge = cockpit.dbus(null, { bus: "internal", "superuser": "try" });
@@ -407,6 +412,9 @@
         /* hostnamed proxies to each machine, if hostnamed available */
         var proxies = { };
 
+        /* clients for the bridge D-Bus API */
+        var bridge_dbus = { };
+
         function process_session_key(key, value) {
             var host, values, machine;
             var parts = key.split("/");
@@ -518,6 +526,7 @@
                 options['temp-session'] = false; /* Compatibility option */
                 options['session'] = 'shared';
                 options['host-key'] = machine.host_key;
+                options['unknown-host'] = "1";
             }
 
             channel = cockpit.channel(options);
@@ -564,6 +573,30 @@
                     });
             }
 
+            /* Try to get change notifications via the internal
+               /packages D-Bus interface of the bridge.  Not all
+               bridges support this API, so we still get the first
+               version of the manifests via HTTP in request_manifest.
+            */
+
+            function watch_manifests() {
+                var dbus = cockpit.dbus(null, { bus: "internal",
+                                                host: machine.connection_string
+                                              });
+                bridge_dbus[host] = dbus;
+                dbus.subscribe({ path: "/packages",
+                                 interface: "org.freedesktop.DBus.Properties",
+                                 member: "PropertiesChanged" },
+                               function (path, iface, mamber, args) {
+                                   if (args[0] == "cockpit.Packages") {
+                                       if (args[1]["Manifests"]) {
+                                           var manifests = JSON.parse(args[1]["Manifests"].v);
+                                           machines.overlay(host, { manifests: manifests });
+                                       }
+                                   }
+                               });
+            }
+
             function request_hostname() {
                 if (!machine.static_hostname) {
                     var proxy = cockpit.dbus("org.freedesktop.hostname1",
@@ -587,6 +620,7 @@
                         open = true;
                         if (url)
                             request_manifest();
+                        watch_manifests();
                         request_hostname();
                         whirl();
                     })
@@ -605,8 +639,10 @@
                     }
                     self.disconnect(host);
                 });
-            } else if (url) {
-                request_manifest();
+            } else {
+                if (url)
+                    request_manifest();
+                watch_manifests();
                 request_hostname();
             }
 
@@ -630,6 +666,12 @@
             if (proxy) {
                 proxy.client.close();
                 $(proxy).off();
+            }
+
+            var dbus = bridge_dbus[host];
+            delete bridge_dbus[host];
+            if (dbus) {
+                dbus.close();
             }
         };
 

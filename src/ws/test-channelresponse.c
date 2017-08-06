@@ -64,6 +64,18 @@ typedef struct {
 } TestResourceFixture;
 
 static void
+on_init_ready (GObject *object,
+               GAsyncResult *result,
+               gpointer data)
+{
+  gboolean *flag = data;
+  g_assert (*flag == FALSE);
+  cockpit_web_service_get_init_message_finish (COCKPIT_WEB_SERVICE (object),
+                                               result);
+  *flag = TRUE;
+}
+
+static void
 setup_resource (TestResourceCase *tc,
                 gconstpointer data)
 {
@@ -75,6 +87,7 @@ setup_resource (TestResourceCase *tc,
   gchar **environ;
   const gchar *user;
   const gchar *home = NULL;
+  gboolean ready = FALSE;
   GBytes *password;
 
   const gchar *argv[] = {
@@ -98,11 +111,19 @@ setup_resource (TestResourceCase *tc,
 
   user = g_get_user_name ();
   password = g_bytes_new_take (g_strdup (PASSWORD), strlen (PASSWORD));
-  creds = cockpit_creds_new (user, "cockpit", COCKPIT_CRED_PASSWORD, password, NULL);
+  creds = cockpit_creds_new ("cockpit", COCKPIT_CRED_USER, user, COCKPIT_CRED_PASSWORD, password, NULL);
   g_bytes_unref (password);
 
   transport = cockpit_pipe_transport_new (tc->pipe);
   tc->service = cockpit_web_service_new (creds, transport);
+
+  /* Manually created services won't be init'd yet,
+   * wait for that before sending data
+   */
+  cockpit_web_service_get_init_message_aysnc (tc->service, on_init_ready, &ready);
+  while (!ready)
+    g_main_context_iteration (NULL, TRUE);
+
   g_object_unref (transport);
 
   cockpit_creds_unref (creds);
@@ -156,9 +177,53 @@ test_resource_simple (TestResourceCase *tc,
   bytes = g_memory_output_stream_steal_as_bytes (tc->output);
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
-                           "Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:\r\n"
+                           "Content-Security-Policy: default-src 'self' http://localhost; connect-src 'self' http://localhost ws: wss:\r\n"
                            "Content-Type: text/html\r\n"
                            "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
+                           "Transfer-Encoding: chunked\r\n"
+                           "Vary: Cookie\r\n"
+                           "\r\n"
+                           "52\r\n"
+                           "<html>\n"
+                           "<head>\n"
+                           "<title>In home dir</title>\n"
+                           "</head>\n"
+                           "<body>In home dir</body>\n"
+                           "</html>\n"
+                           "\r\n"
+                           "0\r\n\r\n", -1);
+  g_bytes_unref (bytes);
+  g_object_unref (response);
+}
+
+static void
+test_resource_simple_host (TestResourceCase *tc,
+                           gconstpointer data)
+{
+  CockpitWebResponse *response;
+  GError *error = NULL;
+  GBytes *bytes;
+  const gchar *url = "/@localhost/another/test.html";
+
+  g_hash_table_insert (tc->headers, g_strdup ("Host"), g_strdup ("my.host"));
+  response = cockpit_web_response_new (tc->io, url, url, NULL, NULL);
+
+  cockpit_channel_response_serve (tc->service, tc->headers, response, "@localhost", "/another/test.html");
+
+  while (cockpit_web_response_get_state (response) != COCKPIT_WEB_RESPONSE_SENT)
+    g_main_context_iteration (NULL, TRUE);
+
+  g_output_stream_close (G_OUTPUT_STREAM (tc->output), NULL, &error);
+  g_assert_no_error (error);
+
+  bytes = g_memory_output_stream_steal_as_bytes (tc->output);
+  cockpit_assert_bytes_eq (bytes,
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Security-Policy: default-src 'self' http://my.host; connect-src 'self' http://my.host ws: wss:\r\n"
+                           "Content-Type: text/html\r\n"
+                           "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://my.host\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Vary: Cookie\r\n"
                            "\r\n"
@@ -198,9 +263,10 @@ test_resource_language (TestResourceCase *tc,
   bytes = g_memory_output_stream_steal_as_bytes (tc->output);
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
-                           "Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:\r\n"
+                           "Content-Security-Policy: default-src 'self' http://localhost; connect-src 'self' http://localhost ws: wss:\r\n"
                            "Content-Type: text/html\r\n"
                            "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Vary: Cookie\r\n"
                            "\r\n"
@@ -240,9 +306,10 @@ test_resource_cookie (TestResourceCase *tc,
   bytes = g_memory_output_stream_steal_as_bytes (tc->output);
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
-                           "Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:\r\n"
+                           "Content-Security-Policy: default-src 'self' http://localhost; connect-src 'self' http://localhost ws: wss:\r\n"
                            "Content-Type: text/html\r\n"
                            "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Vary: Cookie\r\n"
                            "\r\n"
@@ -340,13 +407,15 @@ test_resource_failure (TestResourceCase *tc,
 
   cockpit_expect_message ("*: external channel failed: terminated");
 
-  response = cockpit_web_response_new (tc->io, "/unused", "/unused", NULL, NULL);
-
   /* Now kill the bridge */
   g_assert (cockpit_pipe_get_pid (tc->pipe, &pid));
   g_assert_cmpint (pid, >, 0);
   g_assert_cmpint (kill (pid, SIGTERM), ==, 0);
+  /* Wait until it's gone; we can't use waitpid(), it interferes with GChildWatch */
+  while (kill (pid, 0) >= 0)
+    g_usleep (1000);
 
+  response = cockpit_web_response_new (tc->io, "/unused", "/unused", NULL, NULL);
   cockpit_channel_response_serve (tc->service, tc->headers, response, "@localhost", "/another/test.html");
 
   while (cockpit_web_response_get_state (response) != COCKPIT_WEB_RESPONSE_SENT)
@@ -372,11 +441,6 @@ test_resource_failure (TestResourceCase *tc,
 
 static const TestResourceFixture checksum_fixture = {
   .xdg_data_home = "/nonexistant"
-};
-
-static const TestResourceFixture checksum_path_fixture = {
-  .xdg_data_home = "/nonexistant",
-  .org_path = TRUE
 };
 
 
@@ -441,6 +505,7 @@ test_resource_checksum (TestResourceCase *tc,
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
                            "ETag: \"$060119c2a544d8e5becd0f74f9dcde146b8d99e3-c\"\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Cache-Control: max-age=31556926, public\r\n"
                            "\r\n"
@@ -448,75 +513,6 @@ test_resource_checksum (TestResourceCase *tc,
                            "These are the contents of file.ext\nOh marmalaaade\n"
                            "\r\n"
                            "0\r\n\r\n", -1);
-  g_bytes_unref (bytes);
-  g_object_unref (response);
-}
-
-static void
-test_resource_redirect_checksum (TestResourceCase *tc,
-                                 gconstpointer data)
-{
-  CockpitWebResponse *response;
-  GInputStream *input;
-  GOutputStream *output;
-  GIOStream *io;
-  GError *error = NULL;
-  GBytes *bytes;
-  const TestResourceFixture *fix = data;
-  const gchar *expected;
-  /* We require that no user packages are loaded, so we have a checksum */
-  g_assert (fix->xdg_data_home != NULL);
-
-
-  input = g_memory_input_stream_new_from_data ("", 0, NULL);
-  output = g_memory_output_stream_new (NULL, 0, g_realloc, g_free);
-  io = mock_io_stream_new (input, output);
-  g_object_unref (input);
-
-  /* Start the connection up, and poke it a bit */
-  response = cockpit_web_response_new (io, "/", "/", NULL, NULL);
-  cockpit_channel_response_serve (tc->service, tc->headers, response, "@localhost", "/test/sub/file.ext");
-
-  while (cockpit_web_response_get_state (response) != COCKPIT_WEB_RESPONSE_SENT)
-    g_main_context_iteration (NULL, TRUE);
-
-  g_object_unref (io);
-  g_object_unref (output);
-  g_object_unref (response);
-
-  /* Now do the real request ... we should be redirected */
-  response = cockpit_web_response_new (tc->io,
-                                       fix->org_path ? "/path/unused" : "/unused",
-                                       "/unused", NULL, NULL);
-  cockpit_channel_response_serve (tc->service, tc->headers, response, "@localhost", "/test/sub/file.ext");
-
-  while (cockpit_web_response_get_state (response) != COCKPIT_WEB_RESPONSE_SENT)
-    g_main_context_iteration (NULL, TRUE);
-
-  g_output_stream_close (G_OUTPUT_STREAM (tc->output), NULL, &error);
-  g_assert_no_error (error);
-
-  bytes = g_memory_output_stream_steal_as_bytes (tc->output);
-  if (fix->org_path)
-    {
-      expected = "HTTP/1.1 307 Temporary Redirect\r\n"
-                 "Content-Type: text/html\r\n"
-                 "Location: /path/cockpit/$060119c2a544d8e5becd0f74f9dcde146b8d99e3/test/sub/file.ext\r\n"
-                 "Content-Length: 91\r\n"
-                 "\r\n"
-                 "<html><head><title>Temporary redirect</title></head><body>Access via checksum</body></html>";
-    }
-  else
-    {
-      expected = "HTTP/1.1 307 Temporary Redirect\r\n"
-                 "Content-Type: text/html\r\n"
-                 "Location: /cockpit/$060119c2a544d8e5becd0f74f9dcde146b8d99e3/test/sub/file.ext\r\n"
-                 "Content-Length: 91\r\n"
-                 "\r\n"
-                 "<html><head><title>Temporary redirect</title></head><body>Access via checksum</body></html>";
-    }
-
-  cockpit_assert_bytes_eq (bytes, expected, -1);
   g_bytes_unref (bytes);
   g_object_unref (response);
 }
@@ -583,6 +579,7 @@ test_resource_not_modified_new_language (TestResourceCase *tc,
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
                            "ETag: \"$060119c2a544d8e5becd0f74f9dcde146b8d99e3-de\"\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Cache-Control: max-age=31556926, public\r\n"
                            "\r\n"
@@ -626,6 +623,7 @@ test_resource_not_modified_cookie_language (TestResourceCase *tc,
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
                            "ETag: \"$060119c2a544d8e5becd0f74f9dcde146b8d99e3-fr\"\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Cache-Control: max-age=31556926, public\r\n"
                            "\r\n"
@@ -726,9 +724,10 @@ test_resource_language_suffix (TestResourceCase *tc,
   bytes = g_memory_output_stream_steal_as_bytes (tc->output);
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
-                           "Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:\r\n"
+                           "Content-Security-Policy: default-src 'self' http://localhost; connect-src 'self' http://localhost ws: wss:\r\n"
                            "Content-Type: text/html\r\n"
                            "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Vary: Cookie\r\n"
                            "\r\n"
@@ -767,9 +766,10 @@ test_resource_language_fallback (TestResourceCase *tc,
   bytes = g_memory_output_stream_steal_as_bytes (tc->output);
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
-                           "Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:\r\n"
+                           "Content-Security-Policy: default-src 'self' http://localhost; connect-src 'self' http://localhost ws: wss:\r\n"
                            "Content-Type: text/html\r\n"
                            "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Vary: Cookie\r\n"
                            "\r\n"
@@ -808,19 +808,55 @@ test_resource_gzip_encoding (TestResourceCase *tc,
   cockpit_assert_bytes_eq (bytes,
                            "HTTP/1.1 200 OK\r\n"
                            "Content-Encoding: gzip\r\n"
-                           "Content-Type: text/plain\r\n"
                            "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
+                           "Content-Type: text/plain\r\n"
                            "Transfer-Encoding: chunked\r\n"
                            "Vary: Cookie\r\n"
                            "\r\n"
                            "34\r\n"
                            "\x1F\x8B\x08\x08N1\x03U\x00\x03test-file.txt\x00sT(\xCEM\xCC\xC9Q(I-"
-                           ".QH\xCB\xCCI\xE5\x02\x00>PjG\x12\x00\x00\x00\x0D\x0A" "0\x0D\x0A\x0D\x0A",
-                           209);
+                           ".QH\xCB\xCCI\xE5\x02\x00>PjG\x12\x00\x00\x00\x0D\x0A"
+                           "0\x0D\x0A\x0D\x0A",
+                           256);
   g_bytes_unref (bytes);
   g_object_unref (response);
 }
 
+static void
+test_resource_head (TestResourceCase *tc,
+                    gconstpointer data)
+{
+  CockpitWebResponse *response;
+  GError *error = NULL;
+  GBytes *bytes;
+  const gchar *url = "/@localhost/another/test.html";
+
+  response = cockpit_web_response_new (tc->io, url, url, NULL, NULL);
+  cockpit_web_response_set_method (response, "HEAD");
+
+  cockpit_channel_response_serve (tc->service, tc->headers, response, "@localhost", "/another/test.html");
+
+  while (cockpit_web_response_get_state (response) != COCKPIT_WEB_RESPONSE_SENT)
+    g_main_context_iteration (NULL, TRUE);
+
+  g_output_stream_close (G_OUTPUT_STREAM (tc->output), NULL, &error);
+  g_assert_no_error (error);
+
+  bytes = g_memory_output_stream_steal_as_bytes (tc->output);
+  cockpit_assert_bytes_eq (bytes,
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Security-Policy: default-src 'self' http://localhost; connect-src 'self' http://localhost ws: wss:\r\n"
+                           "Content-Type: text/html\r\n"
+                           "Cache-Control: no-cache, no-store\r\n"
+                           "Access-Control-Allow-Origin: http://localhost\r\n"
+                           "Transfer-Encoding: chunked\r\n"
+                           "Vary: Cookie\r\n"
+                           "\r\n"
+                           "0\r\n\r\n", -1);
+  g_bytes_unref (bytes);
+  g_object_unref (response);
+}
 
 static gboolean
 on_hack_raise_sigchld (gpointer user_data)
@@ -851,6 +887,8 @@ main (int argc,
 
   g_test_add ("/web-channel/resource/simple", TestResourceCase, NULL,
               setup_resource, test_resource_simple, teardown_resource);
+  g_test_add ("/web-channel/resource/simple_host", TestResourceCase, NULL,
+              setup_resource, test_resource_simple_host, teardown_resource);
   g_test_add ("/web-channel/resource/language", TestResourceCase, NULL,
               setup_resource, test_resource_language, teardown_resource);
   g_test_add ("/web-channel/resource/cookie", TestResourceCase, NULL,
@@ -863,10 +901,6 @@ main (int argc,
               setup_resource, test_resource_failure, teardown_resource);
   g_test_add ("/web-channel/resource/checksum", TestResourceCase, &checksum_fixture,
               setup_resource, test_resource_checksum, teardown_resource);
-  g_test_add ("/web-channel/resource/redirect-checksum", TestResourceCase, &checksum_fixture,
-              setup_resource, test_resource_redirect_checksum, teardown_resource);
-  g_test_add ("/web-channel/resource/redirect-path-checksum", TestResourceCase, &checksum_path_fixture,
-              setup_resource, test_resource_redirect_checksum, teardown_resource);
   g_test_add ("/web-channel/resource/not-modified", TestResourceCase, &checksum_fixture,
               setup_resource, test_resource_not_modified, teardown_resource);
   g_test_add ("/web-channel/resource/not-modified-new-language", TestResourceCase, &checksum_fixture,
@@ -884,6 +918,8 @@ main (int argc,
 
   g_test_add ("/web-channel/resource/gzip-encoding", TestResourceCase, NULL,
               setup_resource, test_resource_gzip_encoding, teardown_resource);
+  g_test_add ("/web-channel/resource/head", TestResourceCase, NULL,
+              setup_resource, test_resource_head, teardown_resource);
 
   return g_test_run ();
 }

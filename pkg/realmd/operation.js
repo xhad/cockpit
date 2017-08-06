@@ -90,16 +90,26 @@
             auth_changed($(this));
         });
 
-        var title, label;
+        var title, label, text;
         if (mode == 'join') {
             title = _("page-title", _("Join a Domain"));
             label = _("Join");
             $(".realms-op-join-only-row").show();
+            $(".realms-op-leave-only-row").hide();
             check("");
         } else {
             title = _("page-title", _("Leave Domain"));
             label = _("Leave");
+            text = _("Are you sure you want to leave this domain?");
+            if (realm && realm.Name) {
+                text = cockpit.format(_("Are you sure you want to leave the '$0' domain?"), realm.Name);
+            }
+
+            text = cockpit.format(_("$0 Only users with local credentials will be able to log into this machine. This may also effect other services as DNS resolution settings and the list of trusted CAs may change."), text);
+
+            $(".realms-op-leave-only-row").text(text);
             $(".realms-op-join-only-row").hide();
+            $(".realms-op-leave-only-row").show();
         }
 
         $(".realms-op-title").text(title);
@@ -132,7 +142,7 @@
                     var error, result = [], path;
                     if (this.state() == "rejected") {
                         error = arguments[0];
-                        $(".realms-op-error")
+                        $(".realms-op-message")
                             .empty()
                             .text(error.message);
                         dfd.reject(error);
@@ -316,6 +326,7 @@
             var id = "cockpit-" + unique;
             unique += 1;
             busy(id);
+            $(".realms-op-error").hide();
 
             ensure()
                 .fail(function() {
@@ -324,7 +335,7 @@
                 .done(function(realm) {
                     var options = { operation: cockpit.variant('s', id) };
 
-                    $(".realms-op-error").empty().show();
+                    $(".realms-op-message").empty();
                     $(".realms-op-diagnostics").empty().hide();
 
                     var diagnostics = "";
@@ -343,7 +354,8 @@
                             call = kerberos.call("Join", [ credentials(), options ]);
                         } else {
                             busy(null);
-                            $(".realms-op-error").empty().text(_("Joining this domain is not supported")).show();
+                            $(".realms-op-message").empty().text(_("Joining this domain is not supported"));
+                            $(".realms-op-error").show();
                         }
                     } else if (mode == 'leave') {
                         call = realm.Deconfigure(options);
@@ -361,9 +373,10 @@
                                 $(dialog).modal("hide");
                             } else {
                                 console.log("Failed to join domain: " + realm.Name + ": " + ex);
-                                $(".realms-op-error").empty().text(ex + " ").show();
+                                $(".realms-op-message").empty().text(ex + " ");
+                                $(".realms-op-error").show();
                                 if (diagnostics) {
-                                    $(".realms-op-error")
+                                    $(".realms-op-message")
                                         .append('<a class="realms-op-more-diagnostics">' + _("More") + '</a>');
                                     $(".realms-op-diagnostics").text(diagnostics);
                                 }

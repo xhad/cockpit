@@ -27,7 +27,7 @@ var service = require("service");
 /* These add themselves to jQuery so just including is enough */
 require("patterns");
 require("bootstrap-datepicker/dist/js/bootstrap-datepicker");
-require("bootstrap-combobox/js/bootstrap-combobox");
+require("patternfly-bootstrap-combobox/js/bootstrap-combobox");
 
 var shutdown = require("./shutdown");
 
@@ -38,11 +38,20 @@ var C_ = cockpit.gettext;
 
 var permission = cockpit.permission({ admin: true });
 $(permission).on("changed", update_hostname_privileged);
+$(permission).on("changed", update_shutdown_privileged);
 
 function update_hostname_privileged() {
     $(".hostname-privileged").update_privileged(
         permission, cockpit.format(
             _("The user <b>$0</b> is not permitted to modify hostnames"),
+            permission.user ? permission.user.name : '')
+    );
+}
+
+function update_shutdown_privileged() {
+    $(".shutdown-privileged").update_privileged(
+        permission, cockpit.format(
+            _("The user <b>$0</b> is not permitted to shutdown or restart this server"),
             permission.user ? permission.user.name : '')
     );
 }
@@ -237,7 +246,7 @@ PageServer.prototype = {
         cockpit.file("/etc/motd").watch(function (content) {
             if (content)
                 content = $.trim(content);
-            if (content && content != window.localStorage.getItem('dismissed-motd')) {
+            if (content && content != cockpit.localStorage.getItem('dismissed-motd')) {
                 $('#motd').text(content);
                 $('#motd-box').show();
             } else {
@@ -248,7 +257,7 @@ PageServer.prototype = {
         });
 
         $('#motd-box button.close').click(function () {
-            window.localStorage.setItem('dismissed-motd', $('#motd').text());
+            cockpit.localStorage.setItem('dismissed-motd', $('#motd').text());
             $('#motd-box').hide();
         });
 
@@ -471,7 +480,8 @@ PageServer.prototype = {
 
         var network_data = {
             direct: [ "network.interface.total.bytes" ],
-            internal: [ "network.all.tx", "network.all.rx" ],
+            internal: [ "network.interface.tx", "network.interface.rx" ],
+            "omit-instances": [ "lo" ],
             units: "bytes",
             derive: "rate"
         };
@@ -596,6 +606,7 @@ PageServer.prototype = {
             if (!str)
                 str = _("Set Host name");
             $("#system_information_hostname_button").text(str);
+            $("#system_information_hostname_button").attr("title", str);
             $("#system_information_os_text").text(self.hostname_proxy.OperatingSystemPrettyName || "");
         }
 

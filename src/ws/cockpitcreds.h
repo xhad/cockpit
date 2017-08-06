@@ -31,17 +31,16 @@ G_BEGIN_DECLS
 
 typedef struct _CockpitCreds       CockpitCreds;
 
+#define COCKPIT_CRED_USER         "user"
 #define COCKPIT_CRED_PASSWORD     "password"
 #define COCKPIT_CRED_RHOST        "rhost"
 #define COCKPIT_CRED_CSRF_TOKEN   "csrf-token"
-#define COCKPIT_CRED_LOGIN_DATA   "login-data"
 
 #define         COCKPIT_TYPE_CREDS           (cockpit_creds_get_type ())
 
 GType           cockpit_creds_get_type       (void) G_GNUC_CONST;
 
-CockpitCreds *  cockpit_creds_new            (const gchar *user,
-                                              const gchar *application,
+CockpitCreds *  cockpit_creds_new            (const gchar *application,
                                               ...) G_GNUC_NULL_TERMINATED;
 
 CockpitCreds *  cockpit_creds_ref            (CockpitCreds *creds);
@@ -52,6 +51,9 @@ void            cockpit_creds_poison         (CockpitCreds *creds);
 
 const gchar *   cockpit_creds_get_user       (CockpitCreds *creds);
 
+void            cockpit_creds_set_user       (CockpitCreds *creds,
+                                              const gchar *user);
+
 GBytes *        cockpit_creds_get_password   (CockpitCreds *creds);
 
 void            cockpit_creds_set_password   (CockpitCreds *creds,
@@ -61,12 +63,10 @@ const gchar *   cockpit_creds_get_rhost      (CockpitCreds *creds);
 
 const gchar *   cockpit_creds_get_csrf_token (CockpitCreds *creds);
 
-gboolean        cockpit_creds_equal          (gconstpointer v1,
-                                              gconstpointer v2);
-
-guint           cockpit_creds_hash           (gconstpointer v);
-
 const gchar *   cockpit_creds_get_application            (CockpitCreds *creds);
+
+void            cockpit_creds_set_login_data             (CockpitCreds *creds,
+                                                          JsonObject *login_data);
 
 JsonObject *    cockpit_creds_get_login_data             (CockpitCreds *creds);
 

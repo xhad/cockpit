@@ -21,8 +21,7 @@
     "use strict";
 
     var angular = require('angular');
-    require('angular-bootstrap/ui-bootstrap.js');
-    require('angular-bootstrap/ui-bootstrap-tpls.js');
+    require('angular-bootstrap-npm/dist/angular-bootstrap.js');
 
     require('./kube-client');
     require('./kube-client-cockpit');
@@ -199,7 +198,6 @@
              * Openshift:
              *  - Have Project objects
              *  - Project objects are listable by any user, only accessilbe returned
-             *  - Project objects are not watchable
              *
              * Kubernetes and Openshift
              *  - Namespace objects are only accessible to all users
@@ -211,8 +209,10 @@
 
             var promise = discoverSettings().then(function(settings) {
                 var ret = [];
-                if (settings.flavor === "openshift")
+                if (settings.flavor === "openshift") {
+                    ret.push(loader.watch("projects", $rootScope));
                     ret.push(loader.load("projects"));
+                }
                 if (settings.isAdmin)
                     ret.push(loader.watch("namespaces", $rootScope));
                 return $q.all(ret);
@@ -239,7 +239,7 @@
                 if (globals)
                     all = select().kind("Namespace");
                 if (!all || all.length === 0)
-                    all = select().kind("Project");
+                    all = select().kind("Project").statusPhase("Active");
 
                 var link, meta, ret = [];
                 for (link in all) {

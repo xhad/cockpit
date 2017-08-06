@@ -1,5 +1,5 @@
 @import "variables.less";
-@import (less) "../../../bower_components/angular/angular-csp.css";
+@import (less) "../../../node_modules/angular/angular-csp.css";
 
 @import (less) "../../lib/page.css";
 @import "/listing.less";
@@ -90,6 +90,10 @@
 
     .namespace-filter {
         margin-top: -3px;
+    }
+
+    .namespace-filter button {
+        margin-bottom: 0px;
     }
 
     .all-images {
@@ -231,4 +235,14 @@
             }
         }
     }
+}
+
+/* overide since registry-image-widget sets
+   the last column to be aligned right
+   but we don't want that when we are
+   using colspan
+ */
+table.listing-ct > thead td[colspan]:last-child,
+table.listing-ct > thead th[colspan]:last-child {
+    text-align: left;
 }

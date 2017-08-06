@@ -63,6 +63,22 @@ export function startVm(vm) {
     return virt('START_VM', { name: vm.name, id: vm.id, connectionName: vm.connectionName });
 }
 
+export function deleteVm(vm, options) {
+    return virt('DELETE_VM', { name: vm.name, id: vm.id, connectionName: vm.connectionName, options: options });
+}
+
+export function vmDesktopConsole(vm, consoleDetail) {
+    return virt('CONSOLE_VM', { name: vm.name, id: vm.id, connectionName: vm.connectionName, consoleDetail });
+}
+
+export function usageStartPolling(vm) {
+    return virt('USAGE_START_POLLING', { name: vm.name, id: vm.id, connectionName: vm.connectionName });
+}
+
+export function usageStopPolling(vm) {
+    return virt('USAGE_STOP_POLLING', { name: vm.name, id: vm.id, connectionName: vm.connectionName });
+}
+
 /**
  * Delay call of polling action.
  *
@@ -75,6 +91,7 @@ export function startVm(vm) {
  * and scheduled on later.
  *
  * @param action I.e. getAllVms()
+ * @param timeout Non-default timeout
  */
 export function delayPolling(action, timeout) {
     return (dispatch, getState) => {
@@ -108,41 +125,17 @@ export function setRefreshInterval(refreshInterval) {
     };
 }
 
-export function updateOrAddVm({ id, name, connectionName, state, osType, fqdn, uptime, currentMemory, rssMemory, vcpus, autostart,
-    actualTimeInMs, cpuTime, disks }) {
-    let vm = {};
-
-    if (id !== undefined) vm.id = id;
-    if (name !== undefined) vm.name = name;
-    if (connectionName !== undefined) vm.connectionName = connectionName;
-    if (state !== undefined) vm.state = state;
-    if (osType !== undefined) vm.osType = osType;
-    if (currentMemory !== undefined) vm.currentMemory = currentMemory;
-    if (rssMemory !== undefined) vm.rssMemory = rssMemory;
-    if (vcpus !== undefined) vm.vcpus = vcpus;
-    if (fqdn !== undefined) vm.fqdn = fqdn;
-    if (uptime !== undefined) vm.uptime = uptime;
-    if (autostart !== undefined) vm.autostart = autostart;
-    if (disks !== undefined) vm.disks = disks;
-
-    if (actualTimeInMs !== undefined) vm.actualTimeInMs = actualTimeInMs;
-    if (cpuTime !== undefined) vm.cpuTime = cpuTime;
-
+export function updateOrAddVm(props) {
     return {
         type: 'UPDATE_ADD_VM',
-        vm
+        vm: props
     };
 }
 
-export function updateVmDisksStats({ id, name, connectionName, disksStats }) {
+export function updateVm(props) {
     return {
-        type: 'UPDATE_VM_DISK_STATS',
-        payload: {
-            id,
-            name,
-            connectionName,
-            disksStats,
-        }
+        type: 'UPDATE_VM',
+        vm: props
     };
 }
 
@@ -155,6 +148,15 @@ export function vmActionFailed({ name, connectionName, message, detail}) {
             message,
             detail
         }
+    };
+}
+
+export function undefineVm(connectionName, name, transientOnly) {
+    return {
+        type: 'UNDEFINE_VM',
+        name,
+        connectionName,
+        transientOnly
     };
 }
 

@@ -86,12 +86,14 @@ Requires: %{name}-system = %{version}-%{release}
 Recommends: %{name}-dashboard = %{version}-%{release}
 Recommends: %{name}-networkmanager = %{version}-%{release}
 Recommends: %{name}-storaged = %{version}-%{release}
-%ifarch x86_64 %{arm} aarch64 ppc64le
+Recommends: sscg >= 2.0.4
+%ifarch x86_64 %{arm} aarch64 ppc64le i686 s390x
 Recommends: %{name}-docker = %{version}-%{release}
 %endif
 Suggests: %{name}-pcp = %{version}-%{release}
 Suggests: %{name}-kubernetes = %{version}-%{release}
 Suggests: %{name}-selinux = %{version}-%{release}
+Suggests: %{name}-packagekit = %{version}-%{release}
 
 %endif
 
@@ -138,6 +140,7 @@ make -j4 check
 %install
 make install DESTDIR=%{buildroot}
 make install-tests DESTDIR=%{buildroot}
+make install-integration-tests DESTDIR=%{buildroot}
 mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/pam.d
 install -p -m 644 tools/cockpit.pam $RPM_BUILD_ROOT%{_sysconfdir}/pam.d/cockpit
 rm -f %{buildroot}/%{_libdir}/cockpit/*.so
@@ -199,6 +202,9 @@ find %{buildroot}%{_datadir}/%{name}/networkmanager -type f >> networkmanager.li
 echo '%dir %{_datadir}/%{name}/ostree' > ostree.list
 find %{buildroot}%{_datadir}/%{name}/ostree -type f >> ostree.list
 
+echo '%dir %{_datadir}/%{name}/packagekit' >> packagekit.list
+find %{buildroot}%{_datadir}/%{name}/packagekit -type f >> packagekit.list
+
 echo '%dir %{_datadir}/%{name}/machines' > machines.list
 find %{buildroot}%{_datadir}/%{name}/machines -type f >> machines.list
 
@@ -210,7 +216,7 @@ echo '%dir %{_datadir}/%{name}/selinux' > selinux.list
 find %{buildroot}%{_datadir}/%{name}/selinux -type f >> selinux.list
 %endif
 
-%ifarch x86_64 %{arm} aarch64 ppc64le
+%ifarch x86_64 %{arm} aarch64 ppc64le i686 s390x
 echo '%dir %{_datadir}/%{name}/docker' > docker.list
 find %{buildroot}%{_datadir}/%{name}/docker -type f >> docker.list
 %else
@@ -356,8 +362,23 @@ Cockpit support for remoting to other servers, bastion hosts, and a basic dashbo
 
 %post dashboard
 # HACK: Until policy changes make it downstream
-# https://bugzilla.redhat.com/show_bug.cgi?id=1381331
-test -f %{_bindir}/chcon && chcon -t cockpit_ws_exec_t %{_libexecdir}/cockpit-ssh
+echo "Applying workaround for broken SELinux policy: https://bugzilla.redhat.com/show_bug.cgi?id=1381331" >&2
+if type semanage >/dev/null 2>&1; then
+    semanage fcontext -a %{_libexecdir}/cockpit-ssh -t cockpit_ws_exec_t || true
+    restorecon %{_libexecdir}/cockpit-ssh || true
+else
+    chcon -t cockpit_ws_exec_t %{_libexecdir}/cockpit-ssh || true
+fi
+%if 0%{?fedora} > 0 && 0%{?fedora} >= 26
+if type semodule >/dev/null 2>&1; then
+    tmp=$(mktemp -d)
+    echo 'module local 1.0; require { type cockpit_ws_exec_t; type cockpit_ws_t; class file execute_no_trans; } allow cockpit_ws_t cockpit_ws_exec_t:file execute_no_trans;' > "$tmp/local.te"
+    checkmodule -M -m -o "$tmp/local.mod" "$tmp/local.te"
+    semodule_package -o "$tmp/local.pp" -m "$tmp/local.mod"
+    semodule -i "$tmp/local.pp"
+    rm -rf "$tmp"
+fi
+%endif
 %endif
 
 %package storaged
@@ -396,6 +417,7 @@ Provides: %{name}-tuned = %{version}-%{release}
 Provides: %{name}-users = %{version}-%{release}
 %if 0%{?rhel}
 Provides: %{name}-networkmanager = %{version}-%{release}
+Obsoletes: %{name}-networkmanager < 135
 Requires: NetworkManager
 Provides: %{name}-kdump = %{version}-%{release}
 Requires: kexec-tools
@@ -417,8 +439,8 @@ This package contains the Cockpit shell and system configuration interfaces.
 
 %package tests
 Summary: Tests for Cockpit
-Requires: %{name}-bridge >= %{version}-%{release}
-Requires: %{name}-system >= %{version}-%{release}
+Requires: %{name}-bridge >= 138
+Requires: %{name}-system >= 138
 Requires: openssh-clients
 Provides: %{name}-test-assets
 Obsoletes: %{name}-test-assets < 132
@@ -428,9 +450,33 @@ This package contains tests and files used while testing Cockpit.
 These files are not required for running Cockpit.
 
 %files tests
-%{_unitdir}/cockpit.service.d
+%config(noreplace) %{_sysconfdir}/cockpit/cockpit.conf
 %{_datadir}/%{name}/playground
 %{_prefix}/lib/cockpit-test-assets
+
+%package integration-tests
+Summary: Integration tests for Cockpit
+Requires: curl
+Requires: expect
+Requires: libvirt
+Requires: libvirt-client
+Requires: libvirt-daemon
+Requires: libvirt-python
+Requires: qemu-kvm
+Requires: npm
+Requires: python
+Requires: rsync
+Requires: xz
+Requires: openssh-clients
+Requires: fontconfig
+
+%description integration-tests
+This package contains Cockpit's integration tests for running in VMs.
+These are not required for running Cockpit.
+
+%files integration-tests
+%{_datadir}/%{name}/test
+%{_datadir}/%{name}/containers
 
 %package ws
 Summary: Cockpit Web Service
@@ -558,13 +604,13 @@ utility setroubleshoot to diagnose and resolve SELinux issues.
 
 %endif
 
-%ifarch x86_64 %{arm} aarch64 ppc64le
+%ifarch x86_64 %{arm} aarch64 ppc64le i686 s390x
 
 %package docker
 Summary: Cockpit user interface for Docker containers
 Requires: %{name}-bridge >= %{required_base}
 Requires: %{name}-shell >= %{required_base}
-Requires: docker >= 1.3.0
+Requires: /usr/bin/docker
 Requires: python
 
 %description docker
@@ -596,6 +642,16 @@ cluster. Installed on the Kubernetes master. This package is not yet complete.
 %{_libexecdir}/cockpit-kube-launch
 %{_libexecdir}/cockpit-stub
 %endif
+
+%package packagekit
+Summary: Cockpit user interface for package updates
+Requires: %{name}-bridge >= %{required_base}
+Requires: PackageKit
+
+%description packagekit
+The Cockpit component for installing package updates, via PackageKit.
+
+%files packagekit -f packagekit.list
 
 # The changelog is automatically generated and merged
 %changelog

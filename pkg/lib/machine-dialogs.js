@@ -50,6 +50,7 @@
         "unknown-hostkey": "unknown-hostkey",
         "invalid-hostkey": "invalid-hostkey",
         "not-found": "add-machine",
+        "unknown-host": "unknown-host",
         "sync-users": "sync-users"
     };
 
@@ -74,7 +75,8 @@
         "invalid-hostkey" : translate_and_init(invalid_hostkey_tmpl),
         "not-supported" : translate_and_init(not_supported_tmpl),
         "sync-users" : translate_and_init(sync_users_tmpl),
-        "unknown-hostkey" : translate_and_init(unknown_hosts_tmpl)
+        "unknown-hostkey" : translate_and_init(unknown_hosts_tmpl),
+        "unknown-host" : translate_and_init(unknown_hosts_tmpl)
     };
 
     function full_address(machines_ins, address) {
@@ -117,7 +119,7 @@
                 current_instance = new AddMachine(self);
             else if (template == "sync-users")
                 current_instance = new SyncUsers(self);
-            else if (template == "unknown-hostkey")
+            else if (template == "unknown-hostkey" || template == "unknown-host")
                 current_instance = new HostKey(self, template);
             else if (template == "invalid-hostkey")
                 current_instance = new HostKey(self, template);
@@ -147,6 +149,7 @@
                 conn_options['temp-session'] = false; /* Compatiblity option */
                 conn_options['session'] = 'shared';
                 conn_options['host-key'] = machine.host_key;
+                conn_options['unknown-host'] = "1";
             }
             var client = cockpit.channel(conn_options);
             client.send("x");
@@ -532,7 +535,8 @@
         var self = this;
         var error_options = null;
         var key = null;
-        var allow_change = problem == "unknown-hostkey";
+        var allow_change = (problem == "unknown-hostkey" ||
+                            problem == "unknown-host");
 
         function add_key() {
             var q;
@@ -568,24 +572,34 @@
 
         function render() {
             var promise = null;
+            var options = {};
+            var match_problem = problem;
             var fp;
+            var path = machines.known_hosts_path;
 
             if (error_options) {
                 key = error_options["host-key"];
                 fp = error_options["host-fingerprint"];
+                if (error_options["invalid-hostkey-file"])
+                    path = error_options["invalid-hostkey-file"];
             }
 
             dialog.render({
                 'context_title' : dialog.context_title,
-                'path' : machines.known_hosts_path,
+                'path' : path,
                 'key' : fp,
                 'key_host' : key ? key.split(' ')[0] : null,
             });
 
             if (!key) {
-                promise = dialog.try_to_connect(dialog.address)
+                if (problem == "unknown-host") {
+                    options["session"] = "private";
+                    match_problem = "unknown-hostkey";
+                }
+
+                promise = dialog.try_to_connect(dialog.address, options)
                     .fail(function(ex) {
-                        if (ex.problem != problem) {
+                        if (ex.problem != match_problem) {
                             dialog.render_error(ex);
                         } else {
                             error_options = ex;

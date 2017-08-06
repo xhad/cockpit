@@ -81,8 +81,8 @@ static MetricDescription metric_descriptions[] = {
   { "disk.all.read",    "bytes", "counter", FALSE, DISK_SAMPLER },
   { "disk.all.written", "bytes", "counter", FALSE, DISK_SAMPLER },
 
-  { "network.all.rx",       "bytes", "counter", FALSE, NETWORK_SAMPLER },
-  { "network.all.tx",       "bytes", "counter", FALSE, NETWORK_SAMPLER },
+  { "network.all.rx",       "bytes", "counter", FALSE, NETWORK_SAMPLER }, /* deprecated */
+  { "network.all.tx",       "bytes", "counter", FALSE, NETWORK_SAMPLER }, /* deprecated */
   { "network.interface.rx", "bytes", "counter", TRUE,  NETWORK_SAMPLER },
   { "network.interface.tx", "bytes", "counter", TRUE,  NETWORK_SAMPLER },
 
@@ -241,6 +241,15 @@ cockpit_internal_metrics_sample (CockpitSamples *samples,
                                  gint64 value)
 {
   CockpitInternalMetrics *self = COCKPIT_INTERNAL_METRICS (samples);
+
+  if (self->omit_instances)
+    {
+      for (int i = 0; self->omit_instances[i]; i++)
+        {
+          if (g_strcmp0 (instance, self->omit_instances[i]) == 0)
+            return;
+        }
+    }
 
   for (int i = 0; i < self->n_metrics; i++)
     {
@@ -520,6 +529,14 @@ cockpit_internal_metrics_finalize (GObject *object)
 
   g_free (self->instances);
   g_free (self->omit_instances);
+
+  for (int i = 0; i < self->n_metrics; i++)
+    {
+      MetricInfo *info = &self->metrics[i];
+      if (info->instances)
+        g_hash_table_unref (info->instances);
+    }
+
   g_free (self->metrics);
 
   G_OBJECT_CLASS (cockpit_internal_metrics_parent_class)->finalize (object);

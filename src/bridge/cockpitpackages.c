@@ -24,6 +24,7 @@
 #include "cockpitpackages.h"
 
 #include "cockpitchannel.h"
+#include "cockpitdbusinternal.h"
 
 #include "common/cockpithex.h"
 #include "common/cockpitjson.h"
@@ -44,12 +45,71 @@ const gchar **cockpit_bridge_data_dirs = NULL; /* default */
 
 gint cockpit_bridge_packages_port = 0;
 
+/* Packages might change while the bridge is running, and we support
+   that with slightly complicated handling of checksums.
+
+   The bridge reports a single checksum for the whole bundle of
+   packages.  This is the checksum that ends up in URLs and cockpit-ws
+   makes routing decisions based on it.
+
+   When the packages change on disk, this bundle checksum also
+   changes.  However, the bridge will not change what it reports; it
+   will keep reporting the original bundle checksum.  This ensures
+   that URLs that use the original checksum continue to work.
+
+   The manifest for a package also contains a checksum, and this
+   checksum will change when the package changes.  The shell can use
+   this second checksum to decide whether to reload a component, for
+   example.
+
+   The checksum of a package in its manifest is also a bundle
+   checksum.  More precisely, it is the oldest bundle checksum that
+   the bridge has seen that includes the exact files of the given
+   package.
+
+   Thus, after the bridge has started, the reported checksum and all
+   manifest checksums are the same.  If a new package appears but none
+   of the old packages are changed, the new package has the new bundle
+   checksum in its manifest, and all the old packages still have the
+   reported checksum.
+
+   In order to load the files of a new package, the shell should not
+   use the reported bridge checksum.  The request might be routed to a
+   wrong host that has the same reported checksum but not the new
+   files.  Loading might also succeed, but the files will then be
+   cached incorrectly.  If the new package changes again, we would
+   still load its old files from the cache.
+
+   The shell should also not use the new checksum from the manifest.
+   Loading will not work because cockpit-ws does not know how to route
+   that checksum.
+
+   Thus, the shell needs to load a new (or updated) package with a
+   "@<host>" URL path.
+
+   In other words: The shell can treat the manifest checksum as a
+   per-package checksum for deciding which packages have been updated.
+   Furthermore, if the manifest checksum is equal to the reported
+   bridge checksum, the shell can (and should) use that checksum in
+   URLs to load files from that package.
+
+
+   In order to detect whether a package has changed or not, the bridge
+   also keeps track of per-package checksums.  These never appear in
+   the API.
+*/
+
 struct _CockpitPackages {
   CockpitWebServer *web_server;
   GHashTable *listing;
   gchar *checksum;
+  gchar *bundle_checksum;
   JsonObject *json;
   gchar *locale;
+
+  gboolean dbus_inited;
+  void (*on_change_callback) (gconstpointer data);
+  gconstpointer on_change_callback_data;
 };
 
 struct _CockpitPackage {
@@ -59,6 +119,8 @@ struct _CockpitPackage {
   GHashTable *paths;
   gchar *unavailable;
   gchar *content_security_policy;
+  gchar *own_checksum;
+  gchar *bundle_checksum;
 };
 
 /*
@@ -72,7 +134,8 @@ struct _CockpitPackage {
  * So we use the fastest, good ol' SHA1.
  */
 
-static gboolean   package_walk_directory   (GChecksum *checksum,
+static gboolean   package_walk_directory   (GChecksum *own_checksum,
+                                            GChecksum *bundle_checksum,
                                             GHashTable *paths,
                                             const gchar *root,
                                             const gchar *directory);
@@ -90,6 +153,8 @@ cockpit_package_free (gpointer data)
   if (package->manifest)
     json_object_unref (package->manifest);
   g_free (package->unavailable);
+  g_free (package->own_checksum);
+  g_free (package->bundle_checksum);
   g_free (package);
 }
 
@@ -117,7 +182,8 @@ validate_path (const gchar *name)
 }
 
 static gboolean
-package_walk_file (GChecksum *checksum,
+package_walk_file (GChecksum *own_checksum,
+                   GChecksum *bundle_checksum,
                    GHashTable *paths,
                    const gchar *root,
                    const gchar *filename)
@@ -140,7 +206,7 @@ package_walk_file (GChecksum *checksum,
   path = g_build_filename (root, filename, NULL);
   if (g_file_test (path, G_FILE_TEST_IS_DIR))
     {
-      ret = package_walk_directory (checksum, paths, root, filename);
+      ret = package_walk_directory (own_checksum, bundle_checksum, paths, root, filename);
       goto out;
     }
 
@@ -152,20 +218,24 @@ package_walk_file (GChecksum *checksum,
       goto out;
     }
 
-  if (checksum)
+  if (own_checksum && bundle_checksum)
     {
       bytes = g_mapped_file_get_bytes (mapped);
       string = g_compute_checksum_for_bytes (G_CHECKSUM_SHA1, bytes);
       g_bytes_unref (bytes);
 
       /*
-       * Place file name and hex checksum into checksum,
+       * Place file name and hex checksum into the checksums,
        * include the null terminators so these values
        * cannot be accidentally have a boundary discrepancy.
        */
-      g_checksum_update (checksum, (const guchar *)filename,
+      g_checksum_update (own_checksum, (const guchar *)filename,
                          strlen (filename) + 1);
-      g_checksum_update (checksum, (const guchar *)string,
+      g_checksum_update (own_checksum, (const guchar *)string,
+                         strlen (string) + 1);
+      g_checksum_update (bundle_checksum, (const guchar *)filename,
+                         strlen (filename) + 1);
+      g_checksum_update (bundle_checksum, (const guchar *)string,
                          strlen (string) + 1);
     }
 
@@ -230,7 +300,8 @@ directory_filenames (const char *directory)
 }
 
 static gboolean
-package_walk_directory (GChecksum *checksum,
+package_walk_directory (GChecksum *own_checksum,
+                        GChecksum *bundle_checksum,
                         GHashTable *paths,
                         const gchar *root,
                         const gchar *directory)
@@ -253,7 +324,7 @@ package_walk_directory (GChecksum *checksum,
         filename = g_build_filename (directory, names[i], NULL);
       else
         filename = g_strdup (names[i]);
-      ret = package_walk_file (checksum, paths, root, filename);
+      ret = package_walk_file (own_checksum, bundle_checksum, paths, root, filename);
       g_free (filename);
       if (!ret)
         goto out;
@@ -391,63 +462,6 @@ compar_package_priority (gconstpointer value1,
 }
 
 static gboolean
-strv_have_prefix (gchar **strv,
-                  const gchar *prefix)
-{
-  gint i;
-
-  for (i = 0; strv && strv[i] != NULL; i++)
-    {
-      if (g_str_has_prefix (strv[i], prefix))
-        return TRUE;
-    }
-  return FALSE;
-}
-
-static gboolean
-setup_content_security_policy (CockpitPackage *package,
-                               const gchar *input)
-{
-  const gchar *default_src = "default-src 'self'";
-  const gchar *connect_src = "connect-src 'self' ws: wss:";
-  gchar **parts = NULL;
-  GString *result;
-  gint i;
-
-  result = g_string_sized_new (128);
-
-  /*
-   * Note that browsers need to be explicitly told they can connect
-   * to a WebSocket. This is non-obvious, but it stems from the fact
-   * that some browsers treat 'https' and 'wss' as different protocols.
-   *
-   * Since each component could establish a WebSocket connection back to
-   * cockpit-ws, we need to insert that into the policy.
-   */
-
-  if (input)
-    parts = g_strsplit (input, ";", -1);
-
-  if (!strv_have_prefix (parts, "default-src "))
-    g_string_append_printf (result, "%s; ", default_src);
-  if (!strv_have_prefix (parts, "connect-src "))
-    g_string_append_printf (result, "%s; ", connect_src);
-
-  for (i = 0; parts && parts[i] != NULL; i++)
-    {
-      g_strstrip (parts[i]);
-      g_string_append_printf (result, "%s; ", parts[i]);
-    }
-
-  g_strfreev (parts);
-
-  /* Remove trailing semicolon */
-  g_string_set_size (result, result->len - 2);
-  package->content_security_policy = g_string_free (result, FALSE);
-  return TRUE;
-}
-
-static gboolean
 check_package_compatible (CockpitPackage *package,
                           JsonObject *manifest)
 {
@@ -514,9 +528,7 @@ setup_package_manifest (CockpitPackage *package,
       return FALSE;
     }
 
-  if (!setup_content_security_policy (package, policy))
-    return FALSE;
-
+  package->content_security_policy = g_strdup (policy);
   json_object_remove_member (manifest, field);
 
   package->manifest = json_object_ref (manifest);
@@ -553,16 +565,19 @@ calc_package_directory (JsonObject *manifest,
 
 static CockpitPackage *
 maybe_add_package (GHashTable *listing,
+                   GHashTable *old_listing,
                    const gchar *parent,
                    const gchar *name,
-                   GChecksum *checksum,
+                   GChecksum *bundle_checksum,
                    gboolean system)
 {
   CockpitPackage *package = NULL;
   gchar *path = NULL;
   gchar *directory = NULL;
   JsonObject *manifest = NULL;
+  GChecksum *own_checksum = NULL;
   GHashTable *paths = NULL;
+  CockpitPackage *old_package;
 
   path = g_build_filename (parent, name, NULL);
 
@@ -595,15 +610,35 @@ maybe_add_package (GHashTable *listing,
   if (system)
     paths = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
 
-  if (checksum || paths)
+  if (bundle_checksum)
+    own_checksum = g_checksum_new (G_CHECKSUM_SHA1);
+
+  if (bundle_checksum || paths)
     {
-      if (!package_walk_directory (checksum, paths, directory, NULL))
+      if (!package_walk_directory (bundle_checksum, own_checksum, paths, directory, NULL))
         goto out;
     }
 
   package = cockpit_package_new (name);
   package->directory = directory;
   directory = NULL;
+
+  if (own_checksum)
+    package->own_checksum = g_strdup (g_checksum_get_string (own_checksum));
+
+  // Keep the old bundle_checksum for this package if none of its
+  // files has changed.
+  if (old_listing)
+    {
+      old_package = g_hash_table_lookup (old_listing, name);
+      if (old_package &&
+          old_package->bundle_checksum &&
+          old_package->own_checksum &&
+          g_strcmp0 (old_package->own_checksum, package->own_checksum) == 0)
+        {
+          package->bundle_checksum = g_strdup (old_package->bundle_checksum);
+        }
+    }
 
   if (paths)
     package->paths = g_hash_table_ref (paths);
@@ -625,13 +660,15 @@ out:
     json_object_unref (manifest);
   if (paths)
     g_hash_table_unref (paths);
-
+  if (own_checksum)
+    g_checksum_free (own_checksum);
   return package;
 }
 
 static gboolean
 build_package_listing (GHashTable *listing,
-                       GChecksum *checksum)
+                       GChecksum *checksum,
+                       GHashTable *old_listing)
 {
   const gchar *const *directories;
   gchar *directory = NULL;
@@ -647,7 +684,7 @@ build_package_listing (GHashTable *listing,
       for (j = 0; packages[j] != NULL; j++)
         {
           /* If any user packages installed, no checksum */
-          if (maybe_add_package (listing, directory, packages[j], checksum, FALSE))
+          if (maybe_add_package (listing, old_listing, directory, packages[j], checksum, FALSE))
             checksum = NULL;
         }
       g_strfreev (packages);
@@ -667,7 +704,7 @@ build_package_listing (GHashTable *listing,
         {
           packages = directory_filenames (directory);
           for (j = 0; packages && packages[j] != NULL; j++)
-            maybe_add_package (listing, directory, packages[j], checksum, TRUE);
+            maybe_add_package (listing, old_listing, directory, packages[j], checksum, TRUE);
           g_strfreev (packages);
         }
       g_free (directory);
@@ -679,30 +716,50 @@ build_package_listing (GHashTable *listing,
 static void
 build_packages (CockpitPackages *packages)
 {
+  GHashTable *old_listing;
   JsonObject *root = NULL;
   CockpitPackage *package;
   GChecksum *checksum;
   GList *names, *l;
   const gchar *name;
 
+  old_listing = packages->listing;
+
   packages->listing = g_hash_table_new_full (g_str_hash, g_str_equal,
                                              NULL, cockpit_package_free);
+  g_free (packages->bundle_checksum);
+  packages->bundle_checksum = NULL;
 
   checksum = g_checksum_new (G_CHECKSUM_SHA1);
-  if (build_package_listing (packages->listing, checksum))
-    packages->checksum = g_strdup (g_checksum_get_string (checksum));
+  if (build_package_listing (packages->listing, checksum, old_listing))
+    {
+      packages->bundle_checksum = g_strdup (g_checksum_get_string (checksum));
+      if (!packages->checksum)
+        packages->checksum = g_strdup (packages->bundle_checksum);
+    }
   g_checksum_free (checksum);
+  if (old_listing)
+    g_hash_table_unref (old_listing);
 
-  /* Build JSON packages block */
+  /* Build JSON packages block and fixup checksums */
+  if (packages->json)
+    json_object_unref (packages->json);
   packages->json = root = json_object_new ();
+  if (packages->checksum)
+    json_object_set_string_member (root, ".checksum", packages->checksum);
 
   names = g_hash_table_get_keys (packages->listing);
   for (l = names; l != NULL; l = g_list_next (l))
     {
       name = l->data;
       package = g_hash_table_lookup (packages->listing, name);
-      if (package->manifest)
+      if (package->manifest) {
         json_object_set_object_member (root, name, json_object_ref (package->manifest));
+        if (!package->bundle_checksum)
+          package->bundle_checksum = g_strdup (packages->bundle_checksum);
+        if (package->bundle_checksum)
+          json_object_set_string_member (package->manifest, ".checksum", package->bundle_checksum);
+      }
     }
 
   g_list_free (names);
@@ -856,6 +913,7 @@ package_content (CockpitPackages *packages,
                  const gchar *name,
                  const gchar *path,
                  const gchar *language,
+                 const gchar *self_origin,
                  GHashTable *headers)
 {
   GBytes *uncompressed = NULL;
@@ -869,6 +927,7 @@ package_content (CockpitPackages *packages,
   gboolean globbing;
   gboolean gzipped;
   const gchar *type;
+  gchar *policy;
 
   globbing = g_str_equal (name, "*");
   if (globbing)
@@ -975,10 +1034,11 @@ package_content (CockpitPackages *packages,
               g_hash_table_insert (headers, g_strdup ("Content-Type"), g_strdup (type));
               if (g_str_has_prefix (type, "text/html"))
                 {
-                  if (package && package->content_security_policy)
+                  if (package)
                     {
-                      g_hash_table_insert (headers, g_strdup ("Content-Security-Policy"),
-                                           g_strdup (package->content_security_policy));
+                      policy = cockpit_web_response_security_policy (package->content_security_policy,
+                                                                     self_origin);
+                      g_hash_table_insert (headers, g_strdup ("Content-Security-Policy"), policy);
                     }
                 }
             }
@@ -1014,6 +1074,9 @@ handle_packages (CockpitWebServer *server,
   const gchar *path;
   GHashTable *out_headers = NULL;
   gchar **languages = NULL;
+  gchar *origin = NULL;
+  const gchar *protocol;
+  const gchar *host;
 
   name = cockpit_web_response_pop_path (response);
   path = cockpit_web_response_get_path (response);
@@ -1044,7 +1107,15 @@ handle_packages (CockpitWebServer *server,
     {
       cockpit_web_response_set_cache_type (response, COCKPIT_WEB_RESPONSE_NO_CACHE);
     }
-  package_content (packages, response, name, path, languages[0], out_headers);
+
+  protocol = g_hash_table_lookup (headers, "X-Forwarded-Proto");
+  host = g_hash_table_lookup (headers, "X-Forwarded-Host");
+  if (protocol && host)
+    origin = g_strdup_printf ("%s://%s", protocol, host);
+  if (origin)
+    g_hash_table_insert (out_headers, g_strdup ("Access-Control-Allow-Origin"), origin);
+
+  package_content (packages, response, name, path, languages[0], origin, out_headers);
 
 out:
   if (out_headers)
@@ -1252,6 +1323,33 @@ cockpit_packages_get_bridges (CockpitPackages *packages)
   return g_list_reverse (result);
 }
 
+JsonObject *
+cockpit_packages_peek_json (CockpitPackages *packages)
+{
+  return packages->json;
+}
+
+void
+cockpit_packages_on_change (CockpitPackages *packages,
+                            void (*callback) (gconstpointer user_data),
+                            gconstpointer user_data)
+{
+  g_assert (callback == NULL || packages->on_change_callback == NULL);
+  packages->on_change_callback = callback;
+  packages->on_change_callback_data = user_data;
+}
+
+static void packages_emit_changed (CockpitPackages *packages);
+
+void
+cockpit_packages_reload (CockpitPackages *packages)
+{
+  build_packages (packages);
+  if (packages->on_change_callback)
+    packages->on_change_callback (packages->on_change_callback_data);
+  packages_emit_changed (packages);
+}
+
 void
 cockpit_packages_free (CockpitPackages *packages)
 {
@@ -1259,6 +1357,7 @@ cockpit_packages_free (CockpitPackages *packages)
     return;
   if (packages->json)
     json_object_unref (packages->json);
+  g_free (packages->bundle_checksum);
   g_free (packages->checksum);
   if (packages->listing)
     g_hash_table_unref (packages->listing);
@@ -1298,4 +1397,144 @@ cockpit_packages_dump (void)
   g_list_free (names);
   g_hash_table_unref (by_name);
   cockpit_packages_free (packages);
+}
+
+/* D-Bus interface */
+
+static GVariant *
+packages_get_manifests (CockpitPackages *packages)
+{
+  GBytes *content = cockpit_json_write_bytes (packages->json);
+  GVariant *manifests = g_variant_new ("s", g_bytes_get_data (content, NULL));
+  g_bytes_unref (content);
+  return manifests;
+}
+
+static void
+packages_emit_changed (CockpitPackages *packages)
+{
+  if (!packages->dbus_inited)
+    return;
+
+  GDBusConnection *connection = cockpit_dbus_internal_server ();
+  if (!connection)
+    return;
+
+  GVariant *signal_value;
+  GVariantBuilder builder;
+  GError *error = NULL;
+
+  g_variant_builder_init (&builder, G_VARIANT_TYPE ("a{sv}"));
+  g_variant_builder_add (&builder, "{sv}", "Manifests", packages_get_manifests (packages));
+  signal_value = g_variant_ref_sink (g_variant_new ("(sa{sv}as)", "cockpit.Packages", &builder, NULL));
+
+  g_dbus_connection_emit_signal (connection,
+                                 NULL,
+                                 "/packages",
+                                 "org.freedesktop.DBus.Properties",
+                                 "PropertiesChanged",
+                                 signal_value,
+                                 &error);
+  if (error != NULL)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CLOSED))
+        g_critical ("failed to send PropertiesChanged signal: %s", error->message);
+      g_error_free (error);
+    }
+  g_variant_unref (signal_value);
+}
+
+static void
+packages_method_call (GDBusConnection *connection,
+                      const gchar *sender,
+                      const gchar *object_path,
+                      const gchar *interface_name,
+                      const gchar *method_name,
+                      GVariant *parameters,
+                      GDBusMethodInvocation *invocation,
+                      gpointer user_data)
+{
+  CockpitPackages *packages = user_data;
+
+  if (g_str_equal (method_name, "Reload"))
+    {
+      cockpit_packages_reload (packages);
+      g_dbus_method_invocation_return_value (invocation, NULL);
+    }
+  else
+    g_return_if_reached ();
+}
+
+static GVariant *
+packages_get_property (GDBusConnection *connection,
+                       const gchar *sender,
+                       const gchar *object_path,
+                       const gchar *interface_name,
+                       const gchar *property_name,
+                       GError **error,
+                       gpointer user_data)
+{
+  CockpitPackages *packages = user_data;
+
+  g_return_val_if_fail (property_name != NULL, NULL);
+
+  if (g_str_equal (property_name, "Manifests"))
+    return packages_get_manifests (packages);
+  else
+    g_return_val_if_reached (NULL);
+}
+
+static GDBusInterfaceVTable packages_vtable = {
+  .method_call = packages_method_call,
+  .get_property = packages_get_property,
+};
+
+static GDBusMethodInfo packages_reload_method = {
+  -1, "Reload", NULL, NULL, NULL
+};
+
+static GDBusMethodInfo *packages_methods[] = {
+  &packages_reload_method,
+  NULL
+};
+
+static GDBusPropertyInfo packages_manifests_property = {
+  -1, "Manifests", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
+static GDBusPropertyInfo *packages_properties[] = {
+  &packages_manifests_property,
+  NULL
+};
+
+static GDBusInterfaceInfo packages_interface = {
+  -1, "cockpit.Packages",
+  packages_methods,
+  NULL, /* signals */
+  packages_properties,
+  NULL  /* annotations */
+};
+
+void
+cockpit_packages_dbus_startup (CockpitPackages *packages)
+{
+  GDBusConnection *connection;
+  GError *error = NULL;
+
+  connection = cockpit_dbus_internal_server ();
+  g_return_if_fail (connection != NULL);
+
+  g_dbus_connection_register_object (connection, "/packages", &packages_interface,
+                                     &packages_vtable, packages, NULL, &error);
+
+  g_object_unref (connection);
+
+  if (error != NULL)
+    {
+      g_critical ("couldn't register DBus cockpit.Packages object: %s", error->message);
+      g_error_free (error);
+      return;
+    }
+
+  packages->dbus_inited = TRUE;
 }

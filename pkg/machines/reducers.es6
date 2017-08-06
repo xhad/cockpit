@@ -17,7 +17,7 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with Cockpit; If not, see <http://www.gnu.org/licenses/>.
  */
-import { combineReducers } from 'redux';
+import { combineReducers } from 'redux/dist/redux';
 import VMS_CONFIG from "./config.es6";
 import { logDebug } from './helpers.es6';
 
@@ -145,28 +145,27 @@ function vms(state, action) {
                 return [...state, action.vm];
             }
 
-            let updatedVm;
-            if (action.vm['actualTimeInMs'] < 0) { // clear the usage data (i.e. VM went down)
-                logDebug(`Clearing usage data for vm '${action.vm.name}'`);
-                updatedVm = Object.assign({}, state[index], action.vm);
-                clearUsageData(updatedVm);
-            } else {
-                timeSampleUsageData(action.vm, state[index]);
-                updatedVm = Object.assign({}, state[index], action.vm);
-            }
-
+            const updatedVm = Object.assign({}, state[index], action.vm);
             return replaceVm({ state, updatedVm, index });
         }
-        case 'UPDATE_VM_DISK_STATS':
+        case 'UPDATE_VM':
         {
-            const indexedVm = findVmToUpdate(state, action.payload);
+            const indexedVm = findVmToUpdate(state, action.vm);
             if (!indexedVm) {
                 return state;
             }
 
-            // replace whole object, disk statistics are read at once
-            const updatedVm = Object.assign(indexedVm.vmCopy, {disksStats: action.payload.disksStats});
+            let updatedVm;
+            if (action.vm['actualTimeInMs'] < 0) { // clear the usage data (i.e. VM went down)
+                logDebug(`Clearing usage data for vm '${action.vm.name}'`);
+                updatedVm = Object.assign(indexedVm.vmCopy, action.vm);
+                clearUsageData(updatedVm);
+            } else {
+                timeSampleUsageData(action.vm, indexedVm.vmCopy);
+                updatedVm = Object.assign(indexedVm.vmCopy, action.vm);
+            }
 
+            // replace whole object
             return replaceVm({ state, updatedVm, index: indexedVm.index });
         }
         case 'VM_ACTION_FAILED': {
@@ -179,6 +178,12 @@ function vms(state, action) {
                 lastMessageDetail: action.payload.detail});
 
             return replaceVm({ state, updatedVm, index: indexedVm.index });
+        }
+        case 'UNDEFINE_VM':
+        {
+            return state
+                .filter(vm => (action.connectionName !== vm.connectionName || action.name != vm.name ||
+                               (action.transientOnly && vm.persistent)));
         }
         case 'DELETE_UNLISTED_VMS':
         {
@@ -214,10 +219,9 @@ function timeSampleUsageData(newVmRecord, previousVmRecord) {
             return;
         } else {
             logDebug(`timeSampleUsageData(): can't compute diff - missing previous record`);
+            newVmRecord.cpuUsage = 0;
         }
     }
-
-    newVmRecord.cpuUsage = 0;
 }
 
 export default combineReducers({

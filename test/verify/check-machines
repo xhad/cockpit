@@ -30,24 +30,106 @@ def readFile(name):
             content = f.read().replace('\n', '')
     return content
 
+SPICE_XML="""
+    <video>
+      <model type='vga' heads='1' primary='yes'/>
+      <alias name='video0'/>
+    </video>
+    <graphics type='spice' port='5900' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+      <image compression='off'/>
+    </graphics>
+"""
+
+VNC_XML="""
+    <video>
+      <model type='vga' heads='1' primary='yes'/>
+      <alias name='video0'/>
+    </video>
+    <graphics type='vnc' port='5900' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+"""
+
+CONSOLE_XML="""
+    <console type='file'>
+      <target type='serial' port='0'/>
+      <source path='{log}'/>
+    </console>
+"""
+
+DOMAIN_XML="""
+<domain type='qemu'>
+  <name>{name}</name>
+  <vcpu>1</vcpu>
+  <os>
+    <type arch='x86_64'>hvm</type>
+    <boot dev='hd'/>
+    <boot dev='network'/>
+  </os>
+  <memory unit='MiB'>256</memory>
+  <currentMemory unit='MiB'>256</currentMemory>
+  <features>
+    <acpi/>
+  </features>
+  <devices>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source dev='/dev/{disk}'/>
+      <target dev='hda' bus='ide'/>
+      <serial>ROOT</serial>
+    </disk>
+    <disk type='file' snapshot='external'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{image}'/>
+      <target dev='hdb' bus='ide'/>
+      <serial>SECOND</serial>
+    </disk>
+    <controller type='scsi' model='virtio-scsi' index='0' id='hot'/>
+    <interface type='network'>
+      <source network='default' bridge='virbr0'/>
+      <target dev='vnet0'/>
+    </interface>
+    {console}
+    {graphics}
+  </devices>
+</domain>
+"""
+
+POOL_XML="""
+<pool type='dir'>
+  <name>images</name>
+  <target>
+    <path>{path}</path>
+  </target>
+</pool>
+"""
+
+VOLUME_XML="""
+<volume type='file'>
+  <name>{name}</name>
+  <key>{image}</key>
+  <capacity unit='bytes'>1073741824</capacity>
+  <target>
+    <path>{image}</path>
+    <format type='qcow2'/>
+  </target>
+</volume>
+"""
+
 # If this test fails to run, the host machine needs:
 # echo "options kvm-intel nested=1" > /etc/modprobe.d/kvm-intel.conf
 # rmmod kvm-intel && modprobe kvm-intel || true
 
 @skipImage("Atomic cannot run virtual machines", "fedora-atomic", "rhel-atomic", "continuous-atomic")
 class TestMachines(MachineCase):
-    vm1_name = "subVmTest1"
-    vm1_id = "#vm-{0}".format(vm1_name)
-    vm1_img = "/var/lib/libvirt/images/{0}.img".format(vm1_name)
-    vm1_img2 = "/var/lib/libvirt/images/{0}_2.img".format(vm1_name)
-    vm1_img3 = "/var/lib/libvirt/images/{0}_3.img".format(vm1_name)
+    created_pool = False
 
-    providerVm1_name = "vm1"
-    providerVm1_id = "#vm-{0}".format(providerVm1_name)
-
-    def envSetup(self):
-        b = self.browser
+    def startVm(self, name, graphics='spice'):
         m = self.machine
+
+        image_file = m.pull("cirros")
+        m.add_disk(serial="NESTED", path=image_file, type="qcow2")
 
         # Ensure everything has started correctly
         m.execute("systemctl start libvirtd")
@@ -56,164 +138,327 @@ class TestMachines(MachineCase):
         # Wait for the network 'default' to become active
         wait(lambda: m.execute(command="virsh net-info default | grep Active"))
 
-        self.login_and_go("/machines")
-        b.wait_in_text("body", "No VM is running or defined on this host")
+        img = "/var/lib/libvirt/images/{0}-2.img".format(name)
+        output = m.execute("readlink /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_NESTED").strip().split("\n")[-1]
 
-        m.execute("qemu-img create -f qcow2 {0} 1G".format(self.vm1_img))
-        m.execute("qemu-img create -f qcow2 {0} 2G".format(self.vm1_img2))
-        m.execute("virt-install --cpu host -r 128 --pxe --force --nographics --noautoconsole "
-                  "--disk path={0},size=1,format=qcow2 --disk path={1},size=2,format=qcow2 "
-                  "-n {2} || true"
-                  .format(self.vm1_img, self.vm1_img2, self.vm1_name))
+        args = {
+            "name": name,
+            "disk": os.path.basename(output),
+            "image": img,
+            "logfile": None,
+            "console": "",
+        }
 
-        # state == 'running' is expected, but can be 'paused' if the VM creation fails. Anyway, the VM shall be listed at least
-        state = m.execute("virsh domstate {0}".format(self.vm1_name)).strip()
-        # debug info: machine state
-        m.message("state: '{0}'".format(state))
-        self.assertIn(state, ["running", "paused"], "Test environment failed to set up - testing VM failed to start")
+        # These operating systems do not log from qemu properly
+        if m.image not in [ "centos-7", "rhel-7", "rhel-7-4" ]:
+            m.execute("chmod 777 /var/log/libvirt")
+            args["logfile"] = "/var/log/libvirt/console-{0}.log".format(name)
+            args["console"] = CONSOLE_XML.format(log=args["logfile"])
 
-        b.wait_in_text("body", "Virtual Machines")
-        b.wait_in_text("tbody tr th", self.vm1_name) # is VM name listed?
+        if graphics == 'spice':
+            cxml = SPICE_XML
+        elif graphics == 'vnc':
+            cxml = VNC_XML
+        elif graphics == 'none':
+            cxml = ""
+        else:
+            assert False, "invalid value for graphics"
+        args["graphics"] = cxml.format(**args)
 
-        return state
+        if not self.created_pool:
+            xml = POOL_XML.format(path="/var/lib/libvirt/images")
+            m.execute("echo \"{0}\" > /tmp/xml && virsh pool-create /tmp/xml".format(xml))
+            self.created_pool = True
 
-    def testBasic(self):
-        state = self.envSetup()
+        xml = VOLUME_XML.format(name=os.path.basename(img), image=img)
+        m.execute("echo \"{0}\" > /tmp/xml && virsh vol-create images /tmp/xml".format(xml))
 
+        xml = DOMAIN_XML.format(**args)
+        m.execute("echo \"{0}\" > /tmp/xml && virsh define /tmp/xml && virsh start {1}".format(xml, name))
+
+        m.execute('[ "$(virsh domstate {0})" = running ] || '
+                  '{{ virsh dominfo {0} >&2; cat /var/log/libvirt/qemu/{0}.log >&2; exit 1; }}'.format(name))
+
+        self.allow_journal_messages('.*denied.*search.*"qemu-system-x86".*dev="proc".*')
+
+        return args
+
+    def testState(self):
         b = self.browser
+        m = self.machine
+        name = "subVmTest1"
+        args = self.startVm(name)
+
+        self.login_and_go("/machines")
+        b.wait_in_text("body", "Virtual Machines")
+        b.wait_in_text("tbody tr th", "subVmTest1")
 
         b.click("tbody tr th") # click on the row header
-        b.wait_present("{0}-state".format(self.vm1_id))
-        b.wait_in_text("{0}-state".format(self.vm1_id), state) # running or paused
-        b.wait_present("{0}-vcpus".format(self.vm1_id))
-        b.wait_in_text("{0}-vcpus".format(self.vm1_id), "1")
+        b.wait_present("#vm-subVmTest1-state")
+        b.wait_in_text("#vm-subVmTest1-state", "running")
 
-        if state == "running":
-            b.click("{0}-off-caret".format(self.vm1_id))
-            b.wait_visible("{0}-forceOff".format(self.vm1_id))
-            b.click("{0}-forceOff".format(self.vm1_id))
-            b.wait_in_text("{0}-state".format(self.vm1_id), "shut off")
-        else:
-            print "WARNING: Test VM creation failed, virt-install finished in 'paused' state. Skipping the 'shut down' scenario"
+        m.execute('[ "$(virsh domstate {0})" = running ] || '
+                  '{{ virsh dominfo {0} >&2; cat /var/log/libvirt/qemu/{0}.log >&2; exit 1; }}'.format(name))
 
-    def wait_for_disk_stats(self, vm_id, target):
+        return args
+
+    def testBasic(self):
+        b = self.browser
+        m = self.machine
+
+        args = self.startVm("subVmTest1")
+
+        self.login_and_go("/machines")
+        b.wait_in_text("body", "Virtual Machines")
+        b.wait_in_text("tbody tr th", "subVmTest1")
+
+        b.click("tbody tr th") # click on the row header
+        b.wait_present("#vm-subVmTest1-state")
+        b.wait_in_text("#vm-subVmTest1-state", "running")
+        b.wait_present("#vm-subVmTest1-vcpus")
+        b.wait_in_text("#vm-subVmTest1-vcpus", "1")
+
+        b.wait_in_text("#vm-subVmTest1-bootorder", "disk,network")
+        emulated_machine = b.eval_js("$('#vm-subVmTest1-emulatedmachine').text()")
+        self.assertTrue(len(emulated_machine) > 0) # emulated machine varies across test machines
+
+        # switch to and check Usage
+        b.wait_present("#vm-subVmTest1-usage")
+        b.click("#vm-subVmTest1-usage")
+        b.wait_present("tbody.open .listing-ct-body td:nth-child(1) .usage-donut-caption")
+        b.wait_in_text("tbody.open .listing-ct-body td:nth-child(1) .usage-donut-caption", "256 MiB")
+        b.wait_present("#chart-donut-0 .donut-title-big-pf")
+        b.wait(lambda: float(b.text("#chart-donut-0 .donut-title-big-pf")) > 0.0)
+        b.wait_present("tbody.open .listing-ct-body td:nth-child(2) .usage-donut-caption")
+        b.wait_in_text("tbody.open .listing-ct-body td:nth-child(2) .usage-donut-caption", "1 vCPU")
+        # CPU usage cannot be nonzero with blank image, so just ensure it's a percentage
+        b.wait_present("#chart-donut-1 .donut-title-big-pf")
+        self.assertLessEqual(float(b.text("#chart-donut-1 .donut-title-big-pf")), 100.0)
+
+        # suspend/resume
+        m.execute("virsh suspend subVmTest1")
+        b.wait_in_text("#vm-subVmTest1-state", "paused")
+        # resume sometimes fails with "unable to execute QEMU command 'cont': Resetting the Virtual Machine is required"
+        m.execute('virsh resume subVmTest1 || { virsh destroy subVmTest1 && virsh start subVmTest1; }')
+        b.wait_in_text("#vm-subVmTest1-state", "running")
+
+        if args["logfile"] is not None:
+            wait(lambda: "Linux version" in self.machine.execute("cat {0}".format(args["logfile"])))
+
+        # shut off
+        b.click("#vm-subVmTest1-off-caret")
+        b.wait_visible("#vm-subVmTest1-forceOff")
+        b.click("#vm-subVmTest1-forceOff")
+        b.wait_in_text("#vm-subVmTest1-state", "shut off")
+
+        # usage should drop to zero
+        b.wait_in_text("#chart-donut-0 .donut-title-big-pf", "0.00")
+        b.wait_in_text("#chart-donut-1 .donut-title-big-pf", "0.0")
+
+        # start another one, should appear automatically
+        self.startVm("subVmTest2")
+        b.wait_present("#app .listing-ct tbody:nth-of-type(2) th")
+        b.wait_in_text("#app .listing-ct tbody:nth-of-type(2) th", "subVmTest2")
+        b.click("#app .listing-ct tbody:nth-of-type(2) th") # click on the row header
+        b.wait_present("#vm-subVmTest2-state")
+        b.wait_in_text("#vm-subVmTest2-state", "running")
+        b.wait_present("#vm-subVmTest2-vcpus")
+        b.wait_in_text("#vm-subVmTest2-vcpus", "1")
+        b.wait_in_text("#vm-subVmTest2-bootorder", "disk,network")
+
+        # restart libvirtd
+        m.execute("systemctl stop libvirtd")
+        b.wait_present("#app .blank-slate-pf")
+        b.wait_visible("#app .blank-slate-pf")
+        b.wait_in_text("#app .blank-slate-pf", "No VM is running")
+        m.execute("systemctl start libvirtd")
+        b.wait_present("#app .listing-ct tbody:nth-of-type(1) th")
+        b.wait_in_text("#app .listing-ct tbody:nth-of-type(1) th", "subVmTest1")
+        b.wait_present("#app .listing-ct tbody:nth-of-type(2) th")
+        b.wait_in_text("#app .listing-ct tbody:nth-of-type(2) th", "subVmTest2")
+        b.wait_present("#vm-subVmTest1-state")
+        b.wait_in_text("#vm-subVmTest1-state", "shut off")
+        b.wait_present("#vm-subVmTest2-state")
+        b.wait_in_text("#vm-subVmTest2-state", "running")
+
+        # stop second VM, event handling should still work
+        b.wait_present("#app .listing-ct tbody:nth-of-type(2) th")
+        b.wait_in_text("#app .listing-ct tbody:nth-of-type(2) th", "subVmTest2")
+        b.click("#app .listing-ct tbody:nth-of-type(2) th") # click on the row header
+        b.click("#vm-subVmTest2-off-caret")
+        b.wait_visible("#vm-subVmTest2-forceOff")
+        b.click("#vm-subVmTest2-forceOff")
+        b.wait_in_text("#vm-subVmTest2-state", "shut off")
+
+        # HACK: restarting libvirtd causes this completely unrelated SELinux issue
+        self.allow_journal_messages('.*denied.*search.*"systemd-machine".*dev="proc".*')
+
+    def wait_for_disk_stats(self, name, target):
         b = self.browser
         try:
             with b.wait_timeout(10):
-                b.wait_present("{0}-disks-{1}-used".format(vm_id, target)) # wait for disk statistics to show up
+                b.wait_present("#vm-{0}-disks-{1}-used".format(name, target)) # wait for disk statistics to show up
         except Error, ex:
             if not ex.msg.startswith('timeout'):
                 exc_info = sys.exc_info()
                 raise exc_info[0], exc_info[1], exc_info[2]
             # stats did not show up, check if user message showed up
             print "Libvirt version does not support disk statistics"
-            b.wait_present("{0}-disksstats-unsupported".format(vm_id))
+            b.wait_present("#vm-{0}-disksstats-unsupported".format(name))
 
     def testDisks(self):
-        state = self.envSetup()
-
         b = self.browser
         m = self.machine
 
-        b.click("tbody tr th") # click on the row header
-        b.wait_present("{0}-state".format(self.vm1_id))
-        b.wait_in_text("{0}-state".format(self.vm1_id), state) # running or paused
-
-        b.wait_present("{0}-disks".format(self.vm1_id)) # wait for the tab
-        b.click("{0}-disks".format(self.vm1_id)) # open the "Disks" subtab
-
-        # Test basic disk properties
-        b.wait_present("{0}-disks-total-value".format(self.vm1_id)) # wait for the "Count" value
-        b.wait_in_text("{0}-disks-total-value".format(self.vm1_id), "2")
-
-        b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "hda"), "hda")
-        b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "hdb"), "hdb")
-
-        b.wait_in_text("{0}-disks-{1}-bus".format(self.vm1_id, "hda"), "ide")
-        b.wait_in_text("{0}-disks-{1}-bus".format(self.vm1_id, "hdb"), "ide")
-
-        b.wait_in_text("{0}-disks-{1}-device".format(self.vm1_id, "hda"), "disk")
-        b.wait_in_text("{0}-disks-{1}-device".format(self.vm1_id, "hdb"), "disk")
-
-        b.wait_in_text("{0}-disks-{1}-source".format(self.vm1_id, "hda"), self.vm1_img)
-        b.wait_in_text("{0}-disks-{1}-source".format(self.vm1_id, "hdb"), self.vm1_img2)
-
-        if state == "running": # if test env setup passed ok
-            # Test domstats
-            self.wait_for_disk_stats(self.vm1_id, "hda")
-            if b.is_present("{0}-disks-{1}-used".format(self.vm1_id, "hda")):
-                b.wait_in_text("{0}-disks-{1}-used".format(self.vm1_id, "hda"), "0.00")
-                b.wait_present("{0}-disks-{1}-used".format(self.vm1_id, "hdb"))
-                b.wait_in_text("{0}-disks-{1}-used".format(self.vm1_id, "hdb"), "0.00")
-
-                b.wait_in_text("{0}-disks-{1}-capacity".format(self.vm1_id, "hda"), "1")
-                b.wait_in_text("{0}-disks-{1}-capacity".format(self.vm1_id, "hdb"), "2")
-            else:
-                print "Disk statistics checks skipped"
-
-            # Test add disk
-            m.execute("qemu-img create -f raw {0} 128M".format(self.vm1_img3))
-            m.execute("virsh attach-disk subVmTest1 {0} vdc".format(self.vm1_img3)) # attach to the virtio bus instead of ide
-
-            b.wait_in_text("{0}-disks-total-value".format(self.vm1_id), "3")
-            b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "hda"), "hda")
-            b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "hdb"), "hdb")
-            b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "vdc"), "vdc")
-
-            b.wait_in_text("{0}-disks-{1}-bus".format(self.vm1_id, "hda"), "ide")
-
-            b.wait_in_text("{0}-disks-{1}-bus".format(self.vm1_id, "vdc"), "virtio")
-            b.wait_in_text("{0}-disks-{1}-device".format(self.vm1_id, "vdc"), "disk")
-            b.wait_in_text("{0}-disks-{1}-source".format(self.vm1_id, "vdc"), self.vm1_img3)
-
-            self.wait_for_disk_stats(self.vm1_id, "vdc")
-            if b.is_present("{0}-disks-{1}-used".format(self.vm1_id, "hda")):
-                b.wait_in_text("{0}-disks-{1}-used".format(self.vm1_id, "vdc"), "0.00")
-                b.wait_in_text("{0}-disks-{1}-capacity".format(self.vm1_id, "vdc"), "0.13") # 128 MB
-
-            # Test remove disk
-            m.execute("virsh detach-disk subVmTest1 vdc")
-            print "Restarting {0}, might take a while".format(self.vm1_id)
-            b.click("{0}-reboot-caret".format(self.vm1_id))
-            b.wait_visible("{0}-forceReboot".format(self.vm1_id))
-            b.click("{0}-forceReboot".format(self.vm1_id))
-
-            b.wait_in_text("{0}-disks-total-value".format(self.vm1_id), "2")
-
-            b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "hda"), "hda")
-            b.wait_in_text("{0}-disks-{1}-target".format(self.vm1_id, "hdb"), "hdb")
-        else:
-            print "WARNING: Test VM creation failed, virt-install finished in 'paused' state. Skipping the 'add/remove disk' scenario"
-
-    def testProvider(self):
-        b = self.browser
-        m = self.machine
-
-        # install the provider
-        m.execute("mkdir /usr/share/cockpit/machines/provider")
-        m.upload(["verify/files/cockpitMachinesTestExternalProvider.js"], "/usr/share/cockpit/machines/provider") # do not rename
-        m.execute("mv /usr/share/cockpit/machines/provider/cockpitMachinesTestExternalProvider.js /usr/share/cockpit/machines/provider/index.js")
+        self.startVm("subVmTest1")
 
         self.login_and_go("/machines")
         b.wait_in_text("body", "Virtual Machines")
-        b.wait_present("{0}-row".format(self.providerVm1_id)) # is VM listed so the provider is correctly loaded, initialized and GET_ALL_VMS() passed??
+        b.wait_in_text("tbody tr th", "subVmTest1")
 
-        b.click("{0}-row".format(self.providerVm1_id)) # click on the row header
-        b.wait_present("{0}-state".format(self.providerVm1_id))
-        b.wait_in_text("{0}-state".format(self.providerVm1_id), "running")
+        b.click("tbody tr th") # click on the row header
+        b.wait_present("#vm-subVmTest1-state")
+        b.wait_in_text("#vm-subVmTest1-state", "running")
 
-        b.click("{0}-off".format(self.providerVm1_id)) # click the Shut Down button
-        b.wait_in_text("{0}-state".format(self.providerVm1_id), "shut off")
+        b.wait_present("#vm-subVmTest1-disks") # wait for the tab
+        b.click("#vm-subVmTest1-disks") # open the "Disks" subtab
 
-        b.click("a:contains('Test Subtab')") # Click on the subtab injected by the Provider
-        b.wait_visible("#test-subtab-body-vm1") # is subtab rendered?
-        b.wait_in_text("#test-subtab-body-vm1", "Content of subtab")
+        # Test basic disk properties
+        b.wait_present("#vm-subVmTest1-disks-total-value") # wait for the "Count" value
+        b.wait_in_text("#vm-subVmTest1-disks-total-value", "2")
 
-        b.click("{0}-run".format(self.providerVm1_id)) # click the Run button which intentionally leads to an error, so check it
-        b.click("a:contains('Overview')") # where the error message is rendered
-        b.wait_visible("{0}-state".format(self.providerVm1_id))
-        b.wait_present("{0}-last-message".format(self.providerVm1_id))
-        b.wait_in_text("{0}-last-message".format(self.providerVm1_id), "VM failed to start")
+        b.wait_in_text("#vm-subVmTest1-disks-hda-target", "hda")
+        b.wait_in_text("#vm-subVmTest1-disks-hdb-target", "hdb")
+
+        b.wait_in_text("#vm-subVmTest1-disks-hda-bus", "ide")
+        b.wait_in_text("#vm-subVmTest1-disks-hdb-bus", "ide")
+
+        b.wait_in_text("#vm-subVmTest1-disks-hda-device", "disk")
+        b.wait_in_text("#vm-subVmTest1-disks-hdb-device", "disk")
+
+        b.wait_in_text("#vm-subVmTest1-disks-hdb-source", "/var/lib/libvirt/images/subVmTest1-2.img")
+
+        # Test domstats
+        self.wait_for_disk_stats("subVmTest1", "hda")
+        if b.is_present("#vm-subVmTest1-disks-hda-used"):
+            b.wait_in_text("#vm-subVmTest1-disks-hda-used", "0.00")
+            b.wait_present("#vm-subVmTest1-disks-hdb-used")
+            b.wait_in_text("#vm-subVmTest1-disks-hdb-used", "0.00")
+
+            b.wait_in_text("#vm-subVmTest1-disks-hdb-capacity", "1")
+
+        # Test add disk
+        m.execute("qemu-img create -f raw /var/lib/libvirt/images/image3.img 128M")
+        m.execute("virsh attach-disk subVmTest1 /var/lib/libvirt/images/image3.img vdc") # attach to the virtio bus instead of ide
+
+        b.wait_in_text("#vm-subVmTest1-disks-total-value", "3")
+        b.wait_in_text("#vm-subVmTest1-disks-hda-target", "hda")
+        b.wait_in_text("#vm-subVmTest1-disks-hdb-target", "hdb")
+        b.wait_in_text("#vm-subVmTest1-disks-vdc-target", "vdc")
+
+        b.wait_in_text("#vm-subVmTest1-disks-hda-bus", "ide")
+
+        b.wait_in_text("#vm-subVmTest1-disks-vdc-bus", "virtio")
+        b.wait_in_text("#vm-subVmTest1-disks-vdc-device", "disk")
+        b.wait_in_text("#vm-subVmTest1-disks-vdc-source", "/var/lib/libvirt/images/image3.img")
+
+        self.wait_for_disk_stats("subVmTest1", "vdc")
+        if b.is_present("#vm-subVmTest1-disks-hda-used"):
+            b.wait_in_text("#vm-subVmTest1-disks-vdc-used", "0.00")
+            b.wait_in_text("#vm-subVmTest1-disks-vdc-capacity", "0.13") # 128 MB
+
+        # Test remove disk
+        m.execute("virsh detach-disk subVmTest1 vdc")
+        print "Restarting vm-subVmTest1, might take a while"
+        b.click("#vm-subVmTest1-reboot-caret")
+        b.wait_visible("#vm-subVmTest1-forceReboot")
+        b.click("#vm-subVmTest1-forceReboot")
+
+        b.wait_in_text("#vm-subVmTest1-disks-total-value", "2")
+
+        b.wait_in_text("#vm-subVmTest1-disks-hda-target", "hda")
+        b.wait_in_text("#vm-subVmTest1-disks-hdb-target", "hdb")
+
+    def testExternalConsole(self):
+        b = self.browser
+
+        self.startVm("subVmTest1")
+
+        self.login_and_go("/machines")
+        b.wait_in_text("body", "Virtual Machines")
+        b.wait_in_text("tbody tr th", "subVmTest1")
+
+        b.click("tbody tr th") # click on the row header
+        b.wait_present("#vm-subVmTest1-state")
+        b.wait_in_text("#vm-subVmTest1-state", "running") # running or paused
+
+        b.wait_present("#vm-subVmTest1-consoles") # wait for the tab
+        b.click("#vm-subVmTest1-consoles") # open the "Console" subtab
+
+        # since VNC is not defined for this VM, the view for "Desktop Viewer" is rendered by default
+        b.wait_present("#vm-subVmTest1-consoles-manual-address") # wait for the tab
+        b.wait_in_text("#vm-subVmTest1-consoles-manual-address", "127.0.0.1")
+        b.wait_in_text("#vm-subVmTest1-consoles-manual-port-spice", "5900")
+
+        b.wait_present("#vm-subVmTest1-consoles-launch") # "Launch Remote Viewer" button
+        b.click("#vm-subVmTest1-consoles-launch")
+        b.wait_present("#dynamically-generated-file") # is .vv file generated for download?
+        self.assertEqual(b.attr("#dynamically-generated-file", "href"), u"data:application/x-virt-viewer,%5Bvirt-viewer%5D%0Atype%3Dspice%0Ahost%3D127.0.0.1%0Aport%3D5900%0Adelete-this-file%3D1%0Afullscreen%3D0%0A")
+
+    def testInlineConsole(self):
+        b = self.browser
+
+        self.startVm("subVmTest1", graphics='vnc')
+
+        self.login_and_go("/machines")
+        b.wait_in_text("body", "Virtual Machines")
+        b.wait_in_text("tbody tr th", "subVmTest1")
+
+        b.click("tbody tr th") # click on the row header
+        b.wait_present("#vm-subVmTest1-state")
+        b.wait_in_text("#vm-subVmTest1-state", "running") # running or paused
+
+        b.wait_present("#vm-subVmTest1-consoles") # wait for the tab
+        b.click("#vm-subVmTest1-consoles") # open the "Console" subtab
+
+        # since VNC is defined for this VM, the view for "In-Browser Viewer" is rendered by default
+        b.wait_present("iframe.machines-console-frame-vnc")
+        b.switch_to_frame("vm-subVmTest1-novnc-frame-container")
+        # FIXME: the usual b.wait_present() does not  work here
+        with b.wait_timeout(360):
+            b.wait(lambda: b.eval_js("document.documentElement.outerHTML.indexOf('noVNC_status_normal') >= 0"))
+        b.wait(lambda: b.eval_js("document.documentElement.outerHTML.indexOf('Connected (unencrypted) to: QEMU (subVmTest1)') >= 0"))
+
+    def testDelete(self):
+        b = self.browser
+        m = self.machine
+
+        name = "subVmTest1"
+        img2 = "/var/lib/libvirt/images/{0}-2.img".format(name)
+
+        self.startVm(name, graphics='vnc')
+
+        self.login_and_go("/machines")
+        b.wait_in_text("body", "Virtual Machines")
+        b.wait_in_text("tbody tr th", name)
+
+        m.execute("test -f {0}".format(img2))
+
+        b.click("tbody tr th") # click on the row header
+        b.wait_present("#vm-{0}-delete".format(name))
+        b.click("#vm-{0}-delete".format(name))
+
+        b.wait_present("#cockpit_modal_dialog")
+        b.wait_present("#cockpit_modal_dialog div:contains(The VM is running)")
+        b.wait_present("#cockpit_modal_dialog tr:contains({0})".format(img2))
+        b.click("#cockpit_modal_dialog button:contains(Delete)")
+        b.wait_not_present("#cockpit_modal_dialog")
+
+        b.wait_not_present("#vm-{0}-row".format(name))
+
+        m.execute("! test -f {0}".format(img2))
+
+        self.assertNotIn(name, m.execute("virsh list --all"))
 
 if __name__ == '__main__':
     test_main()
