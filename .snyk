@@ -1,0 +1,23 @@
+# Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities.
+version: v1.7.1
+ignore: {}
+# patches apply the minimum changes required to fix a vulnerability
+patch:
+  'npm:ejs:20161128':
+    - patternfly > bootstrap-treeview > ejs:
+        patched: '2017-10-13T06:49:59.715Z'
+  'npm:negotiator:20160616':
+    - patternfly > bootstrap-treeview > express > connect > negotiator:
+        patched: '2017-10-13T06:49:59.715Z'
+  'npm:qs:20140806-1':
+    - patternfly > bootstrap-treeview > express > connect > qs:
+        patched: '2017-10-13T06:49:59.715Z'
+  'npm:request:20160119':
+    - patternfly > bootstrap-treeview > phantomjs > request:
+        patched: '2017-10-13T06:49:59.715Z'
+  'npm:tar:20151103':
+    - angular-bootstrap-npm > napa > download > decompress > tar:
+        patched: '2017-10-13T06:49:59.715Z'
+  'npm:tough-cookie:20170905':
+    - patternfly > bootstrap-treeview > phantomjs > request > tough-cookie:
+        patched: '2017-10-13T06:49:59.715Z'
