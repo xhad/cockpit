@@ -1,0 +1,40 @@
+# Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities.
+version: v1.21.5
+ignore: {}
+# patches apply the minimum changes required to fix a vulnerability
+patch:
+  'npm:ejs:20161128':
+    - patternfly > bootstrap-treeview > ejs:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:hoek:20180212':
+    - patternfly > bootstrap-treeview > phantomjs > request > hawk > hoek:
+        patched: '2021-08-04T00:02:39.794Z'
+    - patternfly > bootstrap-treeview > phantomjs > request > hawk > boom > hoek:
+        patched: '2021-08-04T00:02:39.794Z'
+    - patternfly > bootstrap-treeview > phantomjs > request > hawk > sntp > hoek:
+        patched: '2021-08-04T00:02:39.794Z'
+    - patternfly > bootstrap-treeview > phantomjs > request > hawk > cryptiles > boom > hoek:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:mime:20170907':
+    - patternfly > bootstrap-treeview > express > send > mime:
+        patched: '2021-08-04T00:02:39.794Z'
+    - patternfly > bootstrap-treeview > express > connect > send > mime:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:negotiator:20160616':
+    - patternfly > bootstrap-treeview > express > connect > negotiator:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:qs:20140806-1':
+    - patternfly > bootstrap-treeview > express > connect > qs:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:request:20160119':
+    - patternfly > bootstrap-treeview > phantomjs > request:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:tar:20151103':
+    - angular-bootstrap-npm > napa > download > decompress > tar:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:tough-cookie:20170905':
+    - patternfly > bootstrap-treeview > phantomjs > request > tough-cookie:
+        patched: '2021-08-04T00:02:39.794Z'
+  'npm:tunnel-agent:20170305':
+    - patternfly > bootstrap-treeview > phantomjs > request > tunnel-agent:
+        patched: '2021-08-04T00:02:39.794Z'
