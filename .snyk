@@ -1,0 +1,10 @@
+# Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities.
+version: v1.25.1
+ignore: {}
+# patches apply the minimum changes required to fix a vulnerability
+patch:
+  'npm:moment:20160126':
+    - patternfly > eonasdan-bootstrap-datetimepicker > moment:
+        patched: '2024-09-17T05:00:14.139Z'
+        id: 'npm:moment:20160126'
+        path: patternfly > eonasdan-bootstrap-datetimepicker > moment
